@@ -173,6 +173,35 @@ const upsertDomainSchema = z.object({
   deployment_id: z.number().int().positive(),
 });
 
+const domainPolicySchema = z.object({
+  auto_follow: z.boolean(),
+  target_branch: z.string().optional().default("main"),
+  target_environment: z.enum(["dev", "preview", "prod"]).optional().default("prod"),
+});
+
+const createPaymentIntentSchema = z.object({
+  action: z.string().min(1),
+  amount_usdc: z.string().min(1),
+  chain: z.string().optional().default("base"),
+  metadata: z.record(z.string(), z.unknown()).optional().default({}),
+});
+
+const verifyPaymentSchema = z.object({
+  intent_id: z.number().int().positive(),
+  tx_hash: z.string().min(1),
+  payer: z.string().min(1),
+});
+
+const purchaseDomainSchema = z.object({
+  repo_id: z.number().int().positive(),
+  domain: z.string().min(1),
+  period_years: z.number().int().min(1).max(10).optional().default(1),
+  intent_id: z.number().int().positive().optional(),
+  auto_follow: z.boolean().optional().default(true),
+  target_branch: z.string().optional().default("main"),
+  target_environment: z.enum(["dev", "preview", "prod"]).optional().default("prod"),
+});
+
 const metrics = {
   pushTotal: 0,
 };
@@ -229,6 +258,7 @@ export async function createApp(config: AppConfig) {
       c.req.path === "/metrics" ||
       c.req.path === "/skills" ||
       c.req.path.startsWith("/v1/deploy/templates") ||
+      c.req.path.startsWith("/v1/domains/search") ||
       c.req.path === "/v1/register" ||
       c.req.path.startsWith("/deployments/") ||
       c.req.path.startsWith("/apps/")
@@ -362,6 +392,27 @@ export async function createApp(config: AppConfig) {
     );
   });
 
+  app.get("/v1/domains/search", async (c) => {
+    const name = normalizeHost(c.req.query("name"));
+    if (!name || !name.includes(".")) return error(c, 400, "Invalid request", "domain name is required");
+    const tld = name.split(".").pop() ?? "com";
+    const available = !name.startsWith("taken-");
+    const amount = domainQuoteUsdc(tld);
+    return c.json({
+      domain: name,
+      available,
+      quote: {
+        amount_usdc: amount,
+        currency: "USDC",
+        period_years: 1,
+      },
+      payment: {
+        chain: process.env.X402_CHAIN ?? "base",
+        recipient: process.env.X402_RECIPIENT ?? "0x0000000000000000000000000000000000000000",
+      },
+    });
+  });
+
   app.get("/v1/agent/me", async (c) => {
     const agent = await repoService.getAgent(c.get("agentId"));
     if (!agent) return error(c, 404, "Not found", "Agent not found");
@@ -371,6 +422,189 @@ export async function createApp(config: AppConfig) {
       created_at: toISOString(agent.createdAt),
       last_seen: toISOString(agent.lastSeen),
       metadata: parseBody(agent.metadata ?? "{}"),
+    });
+  });
+
+  app.post("/v1/payments/intents", async (c) => {
+    const body = createPaymentIntentSchema.safeParse(parseBody(c.get("rawBody")));
+    if (!body.success) return error(c, 400, "Invalid request", body.error.message);
+    const reference = `x402-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+    const intentId = await repoService.createPaymentIntent({
+      agentId: c.get("agentId"),
+      action: body.data.action,
+      amountUsdc: body.data.amount_usdc,
+      chain: body.data.chain,
+      recipient: process.env.X402_RECIPIENT ?? "0x0000000000000000000000000000000000000000",
+      reference,
+      metadata: body.data.metadata,
+      expiresAt,
+    });
+    if (!intentId) return error(c, 500, "Internal error", "failed to create payment intent");
+    return c.json(
+      {
+        intent_id: intentId,
+        status: "pending",
+        x402: {
+          chain: body.data.chain,
+          token: "USDC",
+          amount_usdc: body.data.amount_usdc,
+          recipient: process.env.X402_RECIPIENT ?? "0x0000000000000000000000000000000000000000",
+          reference,
+          expires_at: expiresAt.toISOString(),
+        },
+      },
+      201,
+    );
+  });
+
+  app.post("/v1/payments/verify", async (c) => {
+    const body = verifyPaymentSchema.safeParse(parseBody(c.get("rawBody")));
+    if (!body.success) return error(c, 400, "Invalid request", body.error.message);
+    const intent = await repoService.getPaymentIntent(body.data.intent_id);
+    if (!intent || intent.agentId !== c.get("agentId")) return error(c, 404, "Not found", "Payment intent not found");
+    if (intent.status === "paid") return c.json({ intent_id: intent.id, status: "paid" });
+    if (new Date(intent.expiresAt).getTime() < Date.now()) return error(c, 409, "Resource conflict", "Payment intent expired");
+
+    const isMockVerified = body.data.tx_hash.startsWith("0x") || body.data.tx_hash.startsWith("mock_");
+    if (!isMockVerified) return error(c, 402, "Payment required", "Invalid payment proof");
+
+    await repoService.markPaymentIntentPaid({
+      intentId: intent.id,
+      txHash: body.data.tx_hash,
+      payer: body.data.payer,
+      amountUsdc: intent.amountUsdc,
+      chain: intent.chain,
+    });
+
+    return c.json({ intent_id: intent.id, status: "paid" });
+  });
+
+  app.post("/v1/domains/purchase", async (c) => {
+    const body = purchaseDomainSchema.safeParse(parseBody(c.get("rawBody")));
+    if (!body.success) return error(c, 400, "Invalid request", body.error.message);
+
+    const repo = await repoService.getRepo(body.data.repo_id);
+    if (!repo) return error(c, 404, "Not found", "Repo not found");
+    const access = await repoService.getRepoAccess(c.get("agentId"), body.data.repo_id);
+    if (!hasAccess(access, "admin")) return error(c, 403, "Forbidden", "Admin access required for domain purchase");
+
+    const domain = normalizeHost(body.data.domain);
+    if (!domain.includes(".")) return error(c, 400, "Invalid request", "Domain must be fully qualified");
+    if (domain.startsWith("taken-")) return error(c, 409, "Resource conflict", "Domain is not available");
+    const tld = domain.split(".").pop() ?? "com";
+    const amount = domainQuoteUsdc(tld, body.data.period_years);
+
+    let intent = body.data.intent_id ? await repoService.getPaymentIntent(body.data.intent_id) : null;
+
+    if (!intent || intent.agentId !== c.get("agentId") || intent.status !== "paid") {
+      const reference = `x402-domain-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+      const createdIntentId = await repoService.createPaymentIntent({
+        agentId: c.get("agentId"),
+        action: "domain_purchase",
+        amountUsdc: amount,
+        chain: process.env.X402_CHAIN ?? "base",
+        recipient: process.env.X402_RECIPIENT ?? "0x0000000000000000000000000000000000000000",
+        reference,
+        metadata: { repo_id: body.data.repo_id, domain, period_years: body.data.period_years },
+        expiresAt,
+      });
+      return c.json(
+        {
+          error: {
+            code: 402,
+            message: "Payment required",
+            details: "Submit paid intent_id to complete purchase",
+          },
+          x402: {
+            intent_id: createdIntentId,
+            amount_usdc: amount,
+            chain: process.env.X402_CHAIN ?? "base",
+            recipient: process.env.X402_RECIPIENT ?? "0x0000000000000000000000000000000000000000",
+            reference,
+            expires_at: expiresAt.toISOString(),
+          },
+        },
+        402,
+      );
+    }
+
+    const orderId = await repoService.createDomainOrder({
+      repoId: body.data.repo_id,
+      agentId: c.get("agentId"),
+      domain,
+      amountUsdc: amount,
+      paymentIntentId: intent.id,
+      periodYears: body.data.period_years,
+      metadata: {
+        provider: "cloudflare_registry_mock",
+        purchased_at: new Date().toISOString(),
+      },
+    });
+
+    const deployments = await repoService.listDeployments(body.data.repo_id, 20);
+    const targetDeployment = deployments.find((item) => item.status === "ready");
+    if (!targetDeployment) {
+      return error(c, 409, "Resource conflict", "No ready deployment available to bind domain");
+    }
+
+    await repoService.upsertCustomDomain({
+      repoId: body.data.repo_id,
+      deploymentId: targetDeployment.id,
+      domain,
+      createdBy: c.get("agentId"),
+      autoFollow: body.data.auto_follow,
+      targetBranch: body.data.target_branch,
+      targetEnvironment: body.data.target_environment,
+    });
+
+    return c.json(
+      {
+        order_id: orderId,
+        domain,
+        provider: "cloudflare_registry_mock",
+        status: "active",
+        bound_deployment_id: targetDeployment.id,
+        auto_follow: body.data.auto_follow,
+        target_branch: body.data.target_branch,
+        target_environment: body.data.target_environment,
+        dns: dnsInstructions(domain, c.req.header("host")),
+      },
+      201,
+    );
+  });
+
+  app.get("/v1/payments/intents/:id", async (c) => {
+    const intent = await repoService.getPaymentIntent(Number(c.req.param("id")));
+    if (!intent || intent.agentId !== c.get("agentId")) return error(c, 404, "Not found", "Payment intent not found");
+    return c.json({
+      id: intent.id,
+      action: intent.action,
+      amount_usdc: intent.amountUsdc,
+      chain: intent.chain,
+      recipient: intent.recipient,
+      reference: intent.reference,
+      status: intent.status,
+      metadata: parseBody(intent.metadata ?? "{}"),
+      expires_at: toISOString(intent.expiresAt),
+      paid_at: toISOString(intent.paidAt),
+      created_at: toISOString(intent.createdAt),
+    });
+  });
+
+  app.get("/v1/billing/ledger", async (c) => {
+    const receipts = await repoService.listPaymentReceipts(c.get("agentId"));
+    return c.json({
+      receipts: receipts.map((item) => ({
+        receipt_id: item.receipt.id,
+        intent_id: item.intent.id,
+        tx_hash: item.receipt.txHash,
+        action: item.intent.action,
+        amount_usdc: item.receipt.amountUsdc,
+        chain: item.receipt.chain,
+        created_at: toISOString(item.receipt.createdAt),
+      })),
     });
   });
 
@@ -1275,6 +1509,7 @@ export async function createApp(config: AppConfig) {
     const buildJobId = await buildExecutor.enqueue({
       repoId: repoResult.repo.id,
       deploymentId,
+      branch: branch.name,
       treeHash: commit.treeHash,
       entryPath,
       runtime: body.data.runtime,
@@ -1498,6 +1733,9 @@ export async function createApp(config: AppConfig) {
       deploymentId: body.data.deployment_id,
       domain,
       createdBy: c.get("agentId"),
+      autoFollow: false,
+      targetBranch: "main",
+      targetEnvironment: "prod",
     });
 
     return c.json(
@@ -1505,11 +1743,33 @@ export async function createApp(config: AppConfig) {
         domain,
         deployment_id: body.data.deployment_id,
         verified: true,
+        auto_follow: false,
+        target_branch: "main",
+        target_environment: "prod",
         access_url: `http://${domain}/`,
         dns: dnsInstructions(domain, c.req.header("host")),
       },
       201,
     );
+  });
+
+  app.patch("/v1/repos/:id/domains/:domain", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "admin");
+    if (!repoResult.ok) return repoResult.response;
+    const body = domainPolicySchema.safeParse(parseBody(c.get("rawBody")));
+    if (!body.success) return error(c, 400, "Invalid request", body.error.message);
+    const domain = normalizeHost(c.req.param("domain"));
+    await repoService.updateDomainPolicy(repoResult.repo.id, domain, {
+      autoFollow: body.data.auto_follow,
+      targetBranch: body.data.target_branch,
+      targetEnvironment: body.data.target_environment,
+    });
+    return c.json({
+      domain,
+      auto_follow: body.data.auto_follow,
+      target_branch: body.data.target_branch,
+      target_environment: body.data.target_environment,
+    });
   });
 
   app.get("/v1/repos/:id/domains", async (c) => {
@@ -1526,6 +1786,27 @@ export async function createApp(config: AppConfig) {
         dns: dnsInstructions(row.domain, c.req.header("host")),
         created_at: toISOString(row.createdAt),
         updated_at: toISOString(row.updatedAt),
+      })),
+    });
+  });
+
+  app.get("/v1/repos/:id/domain-orders", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "read");
+    if (!repoResult.ok) return repoResult.response;
+    const orders = await repoService.listDomainOrders(repoResult.repo.id);
+    return c.json({
+      orders: orders.map((order) => ({
+        id: order.id,
+        domain: order.domain,
+        provider: order.provider,
+        status: order.status,
+        period_years: order.periodYears,
+        amount_usdc: order.amountUsdc,
+        payment_intent_id: order.paymentIntentId,
+        provider_order_id: order.providerOrderId,
+        metadata: parseBody(order.metadata ?? "{}"),
+        created_at: toISOString(order.createdAt),
+        updated_at: toISOString(order.updatedAt),
       })),
     });
   });
@@ -2103,6 +2384,20 @@ function inferResponseContentType(path: string): string {
   if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
   if (path.endsWith(".md")) return "text/markdown; charset=utf-8";
   return "text/plain; charset=utf-8";
+}
+
+function domainQuoteUsdc(tld: string, years = 1): string {
+  const yearlyMap: Record<string, number> = {
+    com: 12,
+    io: 45,
+    ai: 90,
+    dev: 14,
+    app: 18,
+    org: 11,
+    net: 13,
+  };
+  const base = yearlyMap[tld.toLowerCase()] ?? 20;
+  return (base * years).toFixed(2);
 }
 
 function dockerTemplate(framework: "react" | "next" | "api" | "generic"): string {

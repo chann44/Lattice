@@ -8,9 +8,12 @@ import {
   commits,
   deploymentAliases,
   customDomains,
+  domainOrders,
   deploymentWebhooks,
   deployments,
   buildJobs,
+  paymentIntents,
+  paymentReceipts,
   repoSecrets,
   runnerJobs,
   prReviews,
@@ -628,27 +631,52 @@ export class RepositoryService {
     deploymentId: number;
     domain: string;
     createdBy: string;
+    autoFollow?: boolean;
+    targetBranch?: string;
+    targetEnvironment?: string;
   }) {
-    await this.db
-      .insert(customDomains)
-      .values({
-        repoId: input.repoId,
-        deploymentId: input.deploymentId,
-        domain: input.domain,
-        verified: true,
-        createdBy: input.createdBy,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .onConflictDoUpdate({
-        target: customDomains.domain,
-        set: {
+    try {
+      await this.db
+        .insert(customDomains)
+        .values({
           repoId: input.repoId,
           deploymentId: input.deploymentId,
+          domain: input.domain,
           verified: true,
+          autoFollow: input.autoFollow ?? false,
+          targetBranch: input.targetBranch ?? "main",
+          targetEnvironment: input.targetEnvironment ?? "prod",
+          createdBy: input.createdBy,
+          createdAt: new Date(),
           updatedAt: new Date(),
-        },
-      });
+        })
+        .onConflictDoUpdate({
+          target: customDomains.domain,
+          set: {
+            repoId: input.repoId,
+            deploymentId: input.deploymentId,
+            verified: true,
+            autoFollow: input.autoFollow ?? false,
+            targetBranch: input.targetBranch ?? "main",
+            targetEnvironment: input.targetEnvironment ?? "prod",
+            updatedAt: new Date(),
+          },
+        });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!(message.includes("no such column") || message.includes("no column named"))) throw err;
+      await this.db.run(
+        sql`INSERT INTO custom_domains (repo_id, deployment_id, domain, verified, created_by, created_at, updated_at)
+            VALUES (${input.repoId}, ${input.deploymentId}, ${input.domain}, 1, ${input.createdBy}, unixepoch(), unixepoch())
+            ON CONFLICT(domain) DO UPDATE SET repo_id=${input.repoId}, deployment_id=${input.deploymentId}, verified=1, updated_at=unixepoch()`);
+    }
+  }
+
+  async updateDomainPolicy(repoId: number, domain: string, input: { autoFollow: boolean; targetBranch: string; targetEnvironment: string }) {
+    await this.db
+      .update(customDomains)
+      .set({ autoFollow: input.autoFollow, targetBranch: input.targetBranch, targetEnvironment: input.targetEnvironment, updatedAt: new Date() })
+      .where(and(eq(customDomains.repoId, repoId), eq(customDomains.domain, domain)));
   }
 
   async listCustomDomains(repoId: number) {
@@ -667,6 +695,129 @@ export class RepositoryService {
       .where(and(eq(customDomains.domain, domain), eq(customDomains.verified, true)))
       .limit(1);
     return rows[0] ?? null;
+  }
+
+  async autoRebindDomains(repoId: number, deploymentId: number, branch: string, environment: string) {
+    try {
+      const rows = await this.db
+        .select()
+        .from(customDomains)
+        .where(
+          and(
+            eq(customDomains.repoId, repoId),
+            eq(customDomains.autoFollow, true),
+            eq(customDomains.targetBranch, branch),
+            eq(customDomains.targetEnvironment, environment),
+          ),
+        );
+      for (const row of rows) {
+        await this.db
+          .update(customDomains)
+          .set({ deploymentId, updatedAt: new Date() })
+          .where(eq(customDomains.id, row.id));
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes("no such column") || message.includes("no column named")) {
+        return;
+      }
+      throw err;
+    }
+  }
+
+  async createPaymentIntent(input: {
+    agentId: string;
+    action: string;
+    amountUsdc: string;
+    chain: string;
+    recipient: string;
+    reference: string;
+    metadata: Record<string, unknown>;
+    expiresAt: Date;
+  }) {
+    const rows = await this.db
+      .insert(paymentIntents)
+      .values({
+        agentId: input.agentId,
+        action: input.action,
+        amountUsdc: input.amountUsdc,
+        chain: input.chain,
+        recipient: input.recipient,
+        reference: input.reference,
+        status: "pending",
+        metadata: JSON.stringify(input.metadata),
+        expiresAt: input.expiresAt,
+        createdAt: new Date(),
+      })
+      .returning({ id: paymentIntents.id });
+    return rows[0]?.id ?? null;
+  }
+
+  async getPaymentIntent(id: number) {
+    const rows = await this.db.select().from(paymentIntents).where(eq(paymentIntents.id, id)).limit(1);
+    return rows[0] ?? null;
+  }
+
+  async markPaymentIntentPaid(input: { intentId: number; txHash: string; payer: string; amountUsdc: string; chain: string }) {
+    await this.db
+      .insert(paymentReceipts)
+      .values({
+        intentId: input.intentId,
+        txHash: input.txHash,
+        payer: input.payer,
+        amountUsdc: input.amountUsdc,
+        chain: input.chain,
+        createdAt: new Date(),
+      })
+      .onConflictDoNothing({ target: paymentReceipts.txHash });
+
+    await this.db
+      .update(paymentIntents)
+      .set({ status: "paid", paidAt: new Date() })
+      .where(eq(paymentIntents.id, input.intentId));
+  }
+
+  async createDomainOrder(input: {
+    repoId: number;
+    agentId: string;
+    domain: string;
+    amountUsdc: string;
+    paymentIntentId: number;
+    periodYears: number;
+    metadata: Record<string, unknown>;
+  }) {
+    const rows = await this.db
+      .insert(domainOrders)
+      .values({
+        repoId: input.repoId,
+        agentId: input.agentId,
+        domain: input.domain,
+        provider: "cloudflare_registry_mock",
+        status: "active",
+        periodYears: input.periodYears,
+        amountUsdc: input.amountUsdc,
+        paymentIntentId: input.paymentIntentId,
+        providerOrderId: `cf-mock-${Date.now()}`,
+        metadata: JSON.stringify(input.metadata),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .returning({ id: domainOrders.id });
+    return rows[0]?.id ?? null;
+  }
+
+  async listDomainOrders(repoId: number) {
+    return this.db.select().from(domainOrders).where(eq(domainOrders.repoId, repoId)).orderBy(desc(domainOrders.createdAt));
+  }
+
+  async listPaymentReceipts(agentId: string) {
+    const rows = await this.db
+      .select({ receipt: paymentReceipts, intent: paymentIntents })
+      .from(paymentReceipts)
+      .innerJoin(paymentIntents, eq(paymentIntents.id, paymentReceipts.intentId))
+      .where(eq(paymentIntents.agentId, agentId))
+      .orderBy(desc(paymentReceipts.createdAt));
+    return rows;
   }
 
   async getRepoStatus(repoId: number, branch: string) {

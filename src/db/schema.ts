@@ -258,6 +258,9 @@ export const customDomains = sqliteTable(
     deploymentId: integer("deployment_id").notNull(),
     domain: text("domain").notNull(),
     verified: integer("verified", { mode: "boolean" }).notNull().default(true),
+    autoFollow: integer("auto_follow", { mode: "boolean" }).notNull().default(false),
+    targetBranch: text("target_branch").notNull().default("main"),
+    targetEnvironment: text("target_environment").notNull().default("prod"),
     createdBy: text("created_by").notNull(),
     createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
     updatedAt: integer("updated_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
@@ -267,4 +270,57 @@ export const customDomains = sqliteTable(
     index("idx_custom_domains_repo").on(table.repoId),
     index("idx_custom_domains_deployment").on(table.deploymentId),
   ],
+);
+
+export const paymentIntents = sqliteTable(
+  "payment_intents",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    agentId: text("agent_id").notNull(),
+    action: text("action").notNull(),
+    amountUsdc: text("amount_usdc").notNull(),
+    chain: text("chain").notNull().default("base"),
+    recipient: text("recipient").notNull(),
+    reference: text("reference").notNull().unique(),
+    status: text("status").notNull().default("pending"),
+    metadata: text("metadata"),
+    expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
+    paidAt: integer("paid_at", { mode: "timestamp" }),
+    createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  },
+  (table) => [index("idx_payment_intents_agent").on(table.agentId), index("idx_payment_intents_status").on(table.status)],
+);
+
+export const paymentReceipts = sqliteTable(
+  "payment_receipts",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    intentId: integer("intent_id").notNull(),
+    txHash: text("tx_hash").notNull().unique(),
+    payer: text("payer").notNull(),
+    amountUsdc: text("amount_usdc").notNull(),
+    chain: text("chain").notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  },
+  (table) => [index("idx_payment_receipts_intent").on(table.intentId)],
+);
+
+export const domainOrders = sqliteTable(
+  "domain_orders",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    repoId: integer("repo_id").notNull(),
+    agentId: text("agent_id").notNull(),
+    domain: text("domain").notNull(),
+    provider: text("provider").notNull().default("cloudflare_registry_mock"),
+    status: text("status").notNull().default("pending"),
+    periodYears: integer("period_years").notNull().default(1),
+    amountUsdc: text("amount_usdc").notNull(),
+    paymentIntentId: integer("payment_intent_id").notNull(),
+    providerOrderId: text("provider_order_id"),
+    metadata: text("metadata"),
+    createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+    updatedAt: integer("updated_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  },
+  (table) => [index("idx_domain_orders_repo").on(table.repoId), index("idx_domain_orders_status").on(table.status)],
 );

@@ -9,6 +9,7 @@ import { RepositoryService } from "./repository";
 type BuildJobInput = {
   repoId: number;
   deploymentId: number;
+  branch: string;
   treeHash: string;
   entryPath: string;
   runtime: "static" | "docker";
@@ -187,6 +188,10 @@ export class BuildExecutor {
         status: "ready",
         logs,
       });
+      const deployment = await this.repoService.getDeploymentById(item.deploymentId);
+      const metadata = deployment?.metadata ? JSON.parse(deployment.metadata) : {};
+      const env = typeof metadata.environment === "string" ? metadata.environment : "preview";
+      await this.repoService.autoRebindDomains(item.repoId, item.deploymentId, item.branch, env);
       await this.emitWebhooks(item.repoId, item.deploymentId, "ready", logs);
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);

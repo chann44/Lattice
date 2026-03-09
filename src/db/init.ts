@@ -228,10 +228,60 @@ export function initSchema(db: DBClient): void {
       deployment_id INTEGER NOT NULL,
       domain TEXT NOT NULL,
       verified INTEGER NOT NULL DEFAULT 1,
+      auto_follow INTEGER NOT NULL DEFAULT 0,
+      target_branch TEXT NOT NULL DEFAULT 'main',
+      target_environment TEXT NOT NULL DEFAULT 'prod',
       created_by TEXT NOT NULL,
       created_at INTEGER DEFAULT (unixepoch()),
       updated_at INTEGER DEFAULT (unixepoch()),
       UNIQUE(domain)
+    );
+  `);
+
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS payment_intents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      amount_usdc TEXT NOT NULL,
+      chain TEXT NOT NULL DEFAULT 'base',
+      recipient TEXT NOT NULL,
+      reference TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL DEFAULT 'pending',
+      metadata TEXT,
+      expires_at INTEGER NOT NULL,
+      paid_at INTEGER,
+      created_at INTEGER DEFAULT (unixepoch())
+    );
+  `);
+
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS payment_receipts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      intent_id INTEGER NOT NULL,
+      tx_hash TEXT NOT NULL UNIQUE,
+      payer TEXT NOT NULL,
+      amount_usdc TEXT NOT NULL,
+      chain TEXT NOT NULL,
+      created_at INTEGER DEFAULT (unixepoch())
+    );
+  `);
+
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS domain_orders (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo_id INTEGER NOT NULL,
+      agent_id TEXT NOT NULL,
+      domain TEXT NOT NULL,
+      provider TEXT NOT NULL DEFAULT 'cloudflare_registry_mock',
+      status TEXT NOT NULL DEFAULT 'pending',
+      period_years INTEGER NOT NULL DEFAULT 1,
+      amount_usdc TEXT NOT NULL,
+      payment_intent_id INTEGER NOT NULL,
+      provider_order_id TEXT,
+      metadata TEXT,
+      created_at INTEGER DEFAULT (unixepoch()),
+      updated_at INTEGER DEFAULT (unixepoch())
     );
   `);
 
@@ -260,4 +310,9 @@ export function initSchema(db: DBClient): void {
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_runner_jobs_status ON runner_jobs(status);`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_custom_domains_repo ON custom_domains(repo_id);`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_custom_domains_deployment ON custom_domains(deployment_id);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_payment_intents_agent ON payment_intents(agent_id);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_payment_intents_status ON payment_intents(status);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_payment_receipts_intent ON payment_receipts(intent_id);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_domain_orders_repo ON domain_orders(repo_id);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_domain_orders_status ON domain_orders(status);`);
 }

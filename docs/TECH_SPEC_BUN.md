@@ -52,7 +52,10 @@ Implemented endpoints:
 - `POST /v1/repos/:id/deployments`
 - `GET /v1/repos/:id/deployments`
 - `GET /v1/repos/:id/deployments/:deploymentId`
+- `GET /v1/repos/:id/deployments/:deploymentId/build-jobs`
 - `POST /v1/repos/:id/deployments/:deploymentId/promote`
+- `POST /v1/repos/:id/deployment-webhooks`
+- `GET /v1/repos/:id/deployment-webhooks`
 - `GET /deployments/:id/*`
 - `GET /apps/:slug/*`
 - `GET /v1/repos/:id/diff`
@@ -70,6 +73,7 @@ Implemented endpoints:
 - Collaboration model with `admin/write/read` roles.
 - Pull request lifecycle for agent-native review and merge flows.
 - Stable project context identification (`project_key`) for autonomous agents.
+- Async deployment executor with queued build jobs and webhook callbacks.
 
 ## Exclusions
 

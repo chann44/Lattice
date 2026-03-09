@@ -1,5 +1,7 @@
 # Agent-SCM (Bun + TypeScript)
 
+Project name: Lattice.
+
 Server-first Agent-SCM implementation using Bun, Hono, Drizzle, and SQLite.
 
 ## Quick Start

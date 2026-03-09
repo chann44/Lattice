@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { BlobStore } from "../lib/blob-store";
+import { decryptSecret, redactSecrets } from "../lib/secrets";
 import { RepositoryService } from "./repository";
 
 type BuildJobInput = {
@@ -11,6 +12,8 @@ type BuildJobInput = {
   treeHash: string;
   entryPath: string;
   runtime: "static" | "docker";
+  environment: "dev" | "preview" | "prod";
+  secretRefs: string[];
   dockerfilePath?: string;
   composeFilePath?: string;
   timeoutMs: number;
@@ -70,6 +73,15 @@ export class BuildExecutor {
     let logs = "Build queued\nBuild started\n";
 
     try {
+      const secretRows = await this.repoService.getSecretsByKeys(item.repoId, item.environment, item.secretRefs);
+      const envVars: Record<string, string> = {};
+      const secretValues: string[] = [];
+      for (const row of secretRows) {
+        const value = decryptSecret(row.encryptedValue, row.nonce);
+        envVars[row.key] = value;
+        secretValues.push(value);
+      }
+
       const entries = await this.repoService.getTree(item.treeHash);
       for (const entry of entries) {
         if (entry.kind === "dir") {
@@ -90,11 +102,11 @@ export class BuildExecutor {
           throw new Error("docker binary is not available on this host");
         }
 
-        logs += "Running docker build\n";
+        const tag = `agent-scm-${item.deploymentId}`;
+        logs += `Running docker build for tag ${tag}\n`;
         const ac = new AbortController();
         const timer = setTimeout(() => ac.abort(), item.timeoutMs);
         try {
-          const tag = `agent-scm-${item.deploymentId}`;
           const command = item.composeFilePath
             ? ["docker", "compose", "-f", item.composeFilePath, "build"]
             : ["docker", "build", "-t", tag, "-f", item.dockerfilePath ?? "Dockerfile", "."];
@@ -103,18 +115,44 @@ export class BuildExecutor {
             stdout: "pipe",
             stderr: "pipe",
             signal: ac.signal,
+            env: { ...process.env, ...envVars },
           });
           const [stdout, stderr, exitCode] = await Promise.all([
             new Response(proc.stdout).text(),
             new Response(proc.stderr).text(),
             proc.exited,
           ]);
-          logs += stdout;
-          logs += stderr;
+          logs += redactSecrets(stdout, secretValues);
+          logs += redactSecrets(stderr, secretValues);
           if (exitCode !== 0) {
             throw new Error(`docker build failed with code ${exitCode}`);
           }
           logs += `Docker image built: ${tag}\n`;
+
+          if (item.composeFilePath) {
+            const up = Bun.spawnSync(["docker", "compose", "-f", item.composeFilePath, "up", "-d"], {
+              cwd: workDir,
+              stdout: "pipe",
+              stderr: "pipe",
+            });
+            logs += new TextDecoder().decode(up.stdout);
+            logs += new TextDecoder().decode(up.stderr);
+            if (up.exitCode !== 0) {
+              throw new Error(`docker compose up failed with code ${up.exitCode}`);
+            }
+            logs += "Docker compose services started\n";
+          } else {
+            const runtime = await this.startDockerRuntime(tag, item.timeoutMs);
+            logs += `Docker runtime URL: ${runtime.runtimeUrl}\n`;
+            const deployment = await this.repoService.getDeploymentById(item.deploymentId);
+            const metadata = deployment?.metadata ? JSON.parse(deployment.metadata) : {};
+            metadata.runtime_proxy_url = runtime.runtimeUrl;
+            metadata.runtime_container_id = runtime.containerId;
+            metadata.runtime_container_port = runtime.containerPort;
+            await this.repoService.updateDeployment(item.deploymentId, {
+              metadata,
+            });
+          }
         } finally {
           clearTimeout(timer);
         }
@@ -162,6 +200,54 @@ export class BuildExecutor {
     } finally {
       await rm(workDir, { recursive: true, force: true });
     }
+  }
+
+  private async startDockerRuntime(tag: string, timeoutMs: number): Promise<{ runtimeUrl: string; containerId: string; containerPort: number }> {
+    const candidatePorts = [3000, 8080, 80];
+    for (const containerPort of candidatePorts) {
+      const run = Bun.spawnSync(["docker", "run", "-d", "-p", `127.0.0.1::${containerPort}`, tag], {
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (run.exitCode !== 0) {
+        continue;
+      }
+
+      const containerId = new TextDecoder().decode(run.stdout).trim();
+      if (!containerId) {
+        continue;
+      }
+
+      const portInfo = Bun.spawnSync(["docker", "port", containerId, `${containerPort}/tcp`], { stdout: "pipe", stderr: "pipe" });
+      if (portInfo.exitCode !== 0) {
+        Bun.spawnSync(["docker", "rm", "-f", containerId], { stdout: "pipe", stderr: "pipe" });
+        continue;
+      }
+
+      const mapping = new TextDecoder().decode(portInfo.stdout).trim();
+      const hostPort = Number(mapping.split(":").pop());
+      if (!hostPort || Number.isNaN(hostPort)) {
+        Bun.spawnSync(["docker", "rm", "-f", containerId], { stdout: "pipe", stderr: "pipe" });
+        continue;
+      }
+
+      const started = Date.now();
+      while (Date.now() - started < timeoutMs) {
+        try {
+          const response = await fetch(`http://127.0.0.1:${hostPort}`);
+          if (response.status >= 200 && response.status < 500) {
+            return { runtimeUrl: `http://127.0.0.1:${hostPort}`, containerId, containerPort };
+          }
+        } catch {
+          // wait for service to warm
+        }
+        await Bun.sleep(200);
+      }
+
+      Bun.spawnSync(["docker", "rm", "-f", containerId], { stdout: "pipe", stderr: "pipe" });
+    }
+
+    throw new Error("unable to start docker runtime container");
   }
 
   private resolveBuildCommand(entryPath: string): boolean {

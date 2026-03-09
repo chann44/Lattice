@@ -207,3 +207,64 @@ export const buildJobs = sqliteTable(
   },
   (table) => [index("idx_build_jobs_deployment").on(table.deploymentId), index("idx_build_jobs_status").on(table.status)],
 );
+
+export const repoSecrets = sqliteTable(
+  "repo_secrets",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    repoId: integer("repo_id").notNull(),
+    key: text("key").notNull(),
+    environment: text("environment").notNull().default("dev"),
+    encryptedValue: text("encrypted_value").notNull(),
+    nonce: text("nonce").notNull(),
+    updatedBy: text("updated_by").notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+    updatedAt: integer("updated_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  },
+  (table) => [
+    uniqueIndex("repo_secrets_repo_key_env_uq").on(table.repoId, table.key, table.environment),
+    index("idx_repo_secrets_repo").on(table.repoId),
+    index("idx_repo_secrets_env").on(table.environment),
+  ],
+);
+
+export const runnerJobs = sqliteTable(
+  "runner_jobs",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    repoId: integer("repo_id").notNull(),
+    agentId: text("agent_id").notNull(),
+    command: text("command").notNull(),
+    environment: text("environment").notNull().default("dev"),
+    runtime: text("runtime").notNull().default("shell"),
+    status: text("status").notNull().default("queued"),
+    secretRefs: text("secret_refs").notNull().default("[]"),
+    timeoutMs: integer("timeout_ms").notNull().default(120000),
+    memoryLimitMb: integer("memory_limit_mb").notNull().default(512),
+    exitCode: integer("exit_code"),
+    logs: text("logs"),
+    startedAt: integer("started_at", { mode: "timestamp" }),
+    completedAt: integer("completed_at", { mode: "timestamp" }),
+    createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  },
+  (table) => [index("idx_runner_jobs_repo").on(table.repoId), index("idx_runner_jobs_status").on(table.status)],
+);
+
+export const customDomains = sqliteTable(
+  "custom_domains",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    repoId: integer("repo_id").notNull(),
+    deploymentId: integer("deployment_id").notNull(),
+    domain: text("domain").notNull(),
+    verified: integer("verified", { mode: "boolean" }).notNull().default(true),
+    createdBy: text("created_by").notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+    updatedAt: integer("updated_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  },
+  (table) => [
+    uniqueIndex("custom_domains_domain_uq").on(table.domain),
+    index("idx_custom_domains_repo").on(table.repoId),
+    index("idx_custom_domains_deployment").on(table.deploymentId),
+  ],
+);

@@ -7,9 +7,12 @@ import {
   collaborators,
   commits,
   deploymentAliases,
+  customDomains,
   deploymentWebhooks,
   deployments,
   buildJobs,
+  repoSecrets,
+  runnerJobs,
   prReviews,
   projectContexts,
   pullRequests,
@@ -505,6 +508,165 @@ export class RepositoryService {
       .select()
       .from(deploymentWebhooks)
       .where(and(eq(deploymentWebhooks.repoId, repoId), eq(deploymentWebhooks.enabled, true)));
+  }
+
+  async upsertSecret(input: {
+    repoId: number;
+    key: string;
+    environment: string;
+    encryptedValue: string;
+    nonce: string;
+    updatedBy: string;
+  }) {
+    await this.db
+      .insert(repoSecrets)
+      .values({
+        repoId: input.repoId,
+        key: input.key,
+        environment: input.environment,
+        encryptedValue: input.encryptedValue,
+        nonce: input.nonce,
+        updatedBy: input.updatedBy,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: [repoSecrets.repoId, repoSecrets.key, repoSecrets.environment],
+        set: {
+          encryptedValue: input.encryptedValue,
+          nonce: input.nonce,
+          updatedBy: input.updatedBy,
+          updatedAt: new Date(),
+        },
+      });
+  }
+
+  async listSecrets(repoId: number, environment?: string) {
+    if (environment) {
+      return this.db
+        .select()
+        .from(repoSecrets)
+        .where(and(eq(repoSecrets.repoId, repoId), eq(repoSecrets.environment, environment)));
+    }
+    return this.db.select().from(repoSecrets).where(eq(repoSecrets.repoId, repoId));
+  }
+
+  async getSecretsByKeys(repoId: number, environment: string, keys: string[]) {
+    const all = await this.listSecrets(repoId, environment);
+    const requested = new Set(keys);
+    return all.filter((row) => requested.has(row.key));
+  }
+
+  async deleteSecret(repoId: number, environment: string, key: string) {
+    await this.db
+      .delete(repoSecrets)
+      .where(and(eq(repoSecrets.repoId, repoId), eq(repoSecrets.environment, environment), eq(repoSecrets.key, key)));
+  }
+
+  async createRunnerJob(input: {
+    repoId: number;
+    agentId: string;
+    command: string;
+    environment: string;
+    runtime: string;
+    secretRefs: string[];
+    timeoutMs: number;
+    memoryLimitMb: number;
+  }) {
+    const rows = await this.db
+      .insert(runnerJobs)
+      .values({
+        repoId: input.repoId,
+        agentId: input.agentId,
+        command: input.command,
+        environment: input.environment,
+        runtime: input.runtime,
+        status: "queued",
+        secretRefs: JSON.stringify(input.secretRefs),
+        timeoutMs: input.timeoutMs,
+        memoryLimitMb: input.memoryLimitMb,
+        logs: "",
+        createdAt: new Date(),
+      })
+      .returning({ id: runnerJobs.id });
+    return rows[0]?.id ?? null;
+  }
+
+  async markRunnerJobRunning(jobId: number) {
+    await this.db.update(runnerJobs).set({ status: "running", startedAt: new Date() }).where(eq(runnerJobs.id, jobId));
+  }
+
+  async markRunnerJobFinished(jobId: number, status: "completed" | "failed" | "cancelled", logs: string, exitCode: number) {
+    await this.db
+      .update(runnerJobs)
+      .set({ status, logs, exitCode, completedAt: new Date() })
+      .where(eq(runnerJobs.id, jobId));
+  }
+
+  async cancelRunnerJob(jobId: number) {
+    await this.db
+      .update(runnerJobs)
+      .set({ status: "cancelled", completedAt: new Date() })
+      .where(and(eq(runnerJobs.id, jobId), eq(runnerJobs.status, "queued")));
+  }
+
+  async getRunnerJob(repoId: number, jobId: number) {
+    const rows = await this.db
+      .select()
+      .from(runnerJobs)
+      .where(and(eq(runnerJobs.id, jobId), eq(runnerJobs.repoId, repoId)))
+      .limit(1);
+    return rows[0] ?? null;
+  }
+
+  async listRunnerJobs(repoId: number, limit: number) {
+    return this.db.select().from(runnerJobs).where(eq(runnerJobs.repoId, repoId)).orderBy(desc(runnerJobs.createdAt)).limit(limit);
+  }
+
+  async upsertCustomDomain(input: {
+    repoId: number;
+    deploymentId: number;
+    domain: string;
+    createdBy: string;
+  }) {
+    await this.db
+      .insert(customDomains)
+      .values({
+        repoId: input.repoId,
+        deploymentId: input.deploymentId,
+        domain: input.domain,
+        verified: true,
+        createdBy: input.createdBy,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: customDomains.domain,
+        set: {
+          repoId: input.repoId,
+          deploymentId: input.deploymentId,
+          verified: true,
+          updatedAt: new Date(),
+        },
+      });
+  }
+
+  async listCustomDomains(repoId: number) {
+    return this.db.select().from(customDomains).where(eq(customDomains.repoId, repoId)).orderBy(desc(customDomains.createdAt));
+  }
+
+  async removeCustomDomain(repoId: number, domain: string) {
+    await this.db.delete(customDomains).where(and(eq(customDomains.repoId, repoId), eq(customDomains.domain, domain)));
+  }
+
+  async getDeploymentByDomain(domain: string) {
+    const rows = await this.db
+      .select({ domain: customDomains, deployment: deployments })
+      .from(customDomains)
+      .innerJoin(deployments, eq(deployments.id, customDomains.deploymentId))
+      .where(and(eq(customDomains.domain, domain), eq(customDomains.verified, true)))
+      .limit(1);
+    return rows[0] ?? null;
   }
 
   async getRepoStatus(repoId: number, branch: string) {

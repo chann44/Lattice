@@ -135,6 +135,39 @@ Deployment webhooks:
 - List webhooks: `GET /v1/repos/:id/deployment-webhooks`
 - Event: `deployment.updated`
 
+### 6.6) Runtime Proxy (Domain-like Behavior)
+
+When docker runtime is healthy, app routes can proxy to running runtime service.
+
+- App path proxy: `/apps/:slug/*`
+- Immutable deployment proxy: `/deployments/:id/*`
+
+Example:
+
+- `GET /apps/my-service/api/health`
+- `GET /deployments/42/api/health`
+
+This enables domain-style routing where API endpoints are live behind app slug paths.
+
+### 6.7) Custom Domain Binding
+
+Bind deployments to custom hostnames so apps/services can be reached by domain.
+
+- Add domain: `POST /v1/repos/:id/domains`
+- List domains: `GET /v1/repos/:id/domains`
+- Remove domain: `DELETE /v1/repos/:id/domains/:domain`
+
+Add payload:
+
+```json
+{
+  "domain": "my-app.example.com",
+  "deployment_id": 123
+}
+```
+
+Once bound and DNS points to your gateway, requests with `Host: my-app.example.com` are routed to that deployment.
+
 ### 6.5) Templates Agents Should Fetch First
 
 1. Template catalog: `GET /v1/deploy/templates`
@@ -163,6 +196,7 @@ Agents should request templates before generating deployment infra files.
 - Docker templates: `GET /v1/deploy/templates/docker`
 - Deployment template catalog: `GET /v1/deploy/templates`, `GET /v1/deploy/templates/docker-compose`
 - Build job observability: `GET /v1/repos/:id/build-jobs/:jobId`, `GET /v1/repos/:id/build-jobs/:jobId/logs`, `GET /v1/repos/:id/deployments/:deploymentId/links`
+- Domains: `POST /v1/repos/:id/domains`, `GET /v1/repos/:id/domains`, `DELETE /v1/repos/:id/domains/:domain`
 - Commits/history: `GET /v1/repos/:id/last-commit`, `GET /v1/repos/:id/commits`, `GET /v1/repos/:id/commits/:hash`
 - Content: `GET /v1/repos/:id/tree`, `GET /v1/repos/:id/blob/:hash`
 - Change analysis: `POST /v1/repos/:id/check-hashes`, `POST /v1/repos/:id/push`, `GET /v1/repos/:id/diff`, `GET /v1/repos/:id/status`
@@ -298,3 +332,55 @@ To determine active project:
   - resource/time limits per deployment job
 
 This layer is now partially implemented (async queue + limits + webhook callbacks). Next upgrades should add strict sandbox isolation and live log streaming.
+
+## Secrets and Environment Operations
+
+Use repo-scoped encrypted secrets for deploy/jobs.
+
+### Secret APIs
+
+- Create/update: `POST /v1/repos/:id/secrets`
+- List metadata: `GET /v1/repos/:id/secrets?environment=dev`
+- Delete: `DELETE /v1/repos/:id/secrets/:key?environment=dev`
+
+Rules:
+
+- Secret key format: uppercase with underscores (`API_KEY`, `DATABASE_URL`).
+- `admin` role required for create/delete.
+- Secret values are never returned from list APIs.
+
+### Job Runner APIs
+
+- Trigger job: `POST /v1/repos/:id/jobs`
+- List jobs: `GET /v1/repos/:id/jobs`
+- Job detail: `GET /v1/repos/:id/jobs/:jobId`
+- Job logs: `GET /v1/repos/:id/jobs/:jobId/logs`
+- Cancel queued job: `POST /v1/repos/:id/jobs/:jobId/cancel`
+
+Job payload supports:
+
+- `command`
+- `branch`
+- `environment` (`dev|preview|prod`)
+- `runtime` (`shell|docker`)
+- `secret_refs`
+- `timeout_ms`, `memory_limit_mb`
+
+### Deployment with Secrets
+
+Deployment trigger accepts:
+
+- `environment`
+- `secret_refs`
+
+Use this for build-time/runtime config injection without exposing raw values.
+
+## Agent Prompt: Safe Secret Usage
+
+```
+Before running jobs or deployment:
+1) Ensure required secrets exist for target environment.
+2) Reference secrets by key via secret_refs, never inline secret values in code/commands.
+3) Verify logs for masking and non-disclosure.
+4) Use admin role only for secret changes; use write role for execution.
+```

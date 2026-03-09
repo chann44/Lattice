@@ -186,6 +186,55 @@ export function initSchema(db: DBClient): void {
     );
   `);
 
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS repo_secrets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo_id INTEGER NOT NULL,
+      key TEXT NOT NULL,
+      environment TEXT NOT NULL DEFAULT 'dev',
+      encrypted_value TEXT NOT NULL,
+      nonce TEXT NOT NULL,
+      updated_by TEXT NOT NULL,
+      created_at INTEGER DEFAULT (unixepoch()),
+      updated_at INTEGER DEFAULT (unixepoch()),
+      UNIQUE(repo_id, key, environment)
+    );
+  `);
+
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS runner_jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo_id INTEGER NOT NULL,
+      agent_id TEXT NOT NULL,
+      command TEXT NOT NULL,
+      environment TEXT NOT NULL DEFAULT 'dev',
+      runtime TEXT NOT NULL DEFAULT 'shell',
+      status TEXT NOT NULL DEFAULT 'queued',
+      secret_refs TEXT NOT NULL DEFAULT '[]',
+      timeout_ms INTEGER NOT NULL DEFAULT 120000,
+      memory_limit_mb INTEGER NOT NULL DEFAULT 512,
+      exit_code INTEGER,
+      logs TEXT,
+      started_at INTEGER,
+      completed_at INTEGER,
+      created_at INTEGER DEFAULT (unixepoch())
+    );
+  `);
+
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS custom_domains (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo_id INTEGER NOT NULL,
+      deployment_id INTEGER NOT NULL,
+      domain TEXT NOT NULL,
+      verified INTEGER NOT NULL DEFAULT 1,
+      created_by TEXT NOT NULL,
+      created_at INTEGER DEFAULT (unixepoch()),
+      updated_at INTEGER DEFAULT (unixepoch()),
+      UNIQUE(domain)
+    );
+  `);
+
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_commits_repo_branch ON commits(repo_id, branch);`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_commits_repo_created ON commits(repo_id, created_at DESC);`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_branches_repo ON branches(repo_id);`);
@@ -205,4 +254,10 @@ export function initSchema(db: DBClient): void {
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_deployment_webhooks_repo ON deployment_webhooks(repo_id);`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_build_jobs_deployment ON build_jobs(deployment_id);`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_build_jobs_status ON build_jobs(status);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_repo_secrets_repo ON repo_secrets(repo_id);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_repo_secrets_env ON repo_secrets(environment);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_runner_jobs_repo ON runner_jobs(repo_id);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_runner_jobs_status ON runner_jobs(status);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_custom_domains_repo ON custom_domains(repo_id);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_custom_domains_deployment ON custom_domains(deployment_id);`);
 }

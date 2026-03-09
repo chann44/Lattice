@@ -59,6 +59,17 @@ Implemented endpoints:
 - `GET /v1/repos/:id/build-jobs/:jobId`
 - `GET /v1/repos/:id/build-jobs/:jobId/logs`
 - `GET /v1/repos/:id/deployments/:deploymentId/links`
+- `POST /v1/repos/:id/secrets`
+- `GET /v1/repos/:id/secrets`
+- `DELETE /v1/repos/:id/secrets/:key`
+- `POST /v1/repos/:id/jobs`
+- `GET /v1/repos/:id/jobs`
+- `GET /v1/repos/:id/jobs/:jobId`
+- `GET /v1/repos/:id/jobs/:jobId/logs`
+- `POST /v1/repos/:id/jobs/:jobId/cancel`
+- `POST /v1/repos/:id/domains`
+- `GET /v1/repos/:id/domains`
+- `DELETE /v1/repos/:id/domains/:domain`
 - `POST /v1/repos/:id/deployments/:deploymentId/promote`
 - `POST /v1/repos/:id/deployment-webhooks`
 - `GET /v1/repos/:id/deployment-webhooks`
@@ -81,6 +92,9 @@ Implemented endpoints:
 - Stable project context identification (`project_key`) for autonomous agents.
 - Async deployment executor with queued build jobs and webhook callbacks.
 - Deployment runtimes: `static` and `docker` with framework-aware template guidance.
+- Encrypted repo-scoped secrets with environment support (`dev`, `preview`, `prod`).
+- General job runner for shell/docker commands with secret injection and masked logs.
+- Runtime proxy support on deployment/app routes for docker-backed services (`/apps/:slug/*`, `/deployments/:id/*`).
 
 ## Exclusions
 

@@ -10,8 +10,10 @@ import { BlobStore } from "./lib/blob-store";
 import { deriveAgentId, parseAuthHeader, verifyRequestSignature } from "./lib/auth";
 import { RateLimiter } from "./lib/rate-limiter";
 import { sha256Hex } from "./lib/hash";
+import { encryptSecret } from "./lib/secrets";
 import { RepositoryService } from "./services/repository";
 import { BuildExecutor } from "./services/build-executor";
+import { JobRunner } from "./services/job-runner";
 import {
   buildUnifiedDiff,
   bumpVersion,
@@ -135,6 +137,8 @@ const triggerDeploymentSchema = z.object({
   entry_path: z.string().optional(),
   dockerfile_path: z.string().optional(),
   compose_file_path: z.string().optional(),
+  environment: z.enum(["dev", "preview", "prod"]).optional().default("preview"),
+  secret_refs: z.array(z.string()).optional().default([]),
   timeout_ms: z.number().int().min(10_000).max(600_000).optional().default(120_000),
   memory_limit_mb: z.number().int().min(128).max(4096).optional().default(512),
 });
@@ -146,6 +150,27 @@ const promoteDeploymentSchema = z.object({
 const createWebhookSchema = z.object({
   url: z.string().url(),
   secret: z.string().optional(),
+});
+
+const upsertSecretSchema = z.object({
+  key: z.string().min(1).regex(/^[A-Z0-9_]+$/),
+  value: z.string().min(1),
+  environment: z.enum(["dev", "preview", "prod"]).optional().default("dev"),
+});
+
+const runJobSchema = z.object({
+  command: z.string().min(1),
+  branch: z.string().optional().default("main"),
+  environment: z.enum(["dev", "preview", "prod"]).optional().default("dev"),
+  runtime: z.enum(["shell", "docker"]).optional().default("shell"),
+  secret_refs: z.array(z.string()).optional().default([]),
+  timeout_ms: z.number().int().min(10_000).max(600_000).optional().default(120_000),
+  memory_limit_mb: z.number().int().min(128).max(4096).optional().default(512),
+});
+
+const upsertDomainSchema = z.object({
+  domain: z.string().min(1),
+  deployment_id: z.number().int().positive(),
 });
 
 const metrics = {
@@ -163,8 +188,38 @@ export async function createApp(config: AppConfig) {
   const blobStore = new BlobStore(config.blobsDir);
   const limiter = new RateLimiter(config.rateLimitPerMinute, 60_000);
   const buildExecutor = new BuildExecutor(repoService, blobStore, { concurrency: 2 });
+  const jobRunner = new JobRunner(repoService, blobStore, { concurrency: 2 });
 
   const app = new Hono<AppEnv>();
+
+  app.use("*", async (c, next) => {
+    const host = normalizeHost(c.req.header("host"));
+    const path = c.req.path;
+    const reservedHost = host === "127.0.0.1" || host === "localhost" || host.endsWith(".localhost");
+    const reservedPath =
+      path.startsWith("/v1/") || path === "/health" || path === "/metrics" || path === "/skills" || path.startsWith("/apps/") || path.startsWith("/deployments/");
+
+    if (reservedHost || reservedPath || host.length === 0) {
+      await next();
+      return;
+    }
+
+    const bound = await repoService.getDeploymentByDomain(host);
+    if (!bound || bound.deployment.status !== "ready") {
+      await next();
+      return;
+    }
+
+    const metadata = parseBody(bound.deployment.metadata ?? "{}");
+    const requestedPath = extractRequestedPath(path, "");
+    const preferredEntryPath = typeof metadata.entry_path === "string" ? metadata.entry_path : undefined;
+    const runtimeProxy = typeof metadata.runtime_proxy_url === "string" ? metadata.runtime_proxy_url : undefined;
+
+    if (runtimeProxy) {
+      return proxyRuntimeRequest(c, runtimeProxy, requestedPath);
+    }
+    return serveDeploymentPath(c, bound.deployment.treeHash, requestedPath, preferredEntryPath, blobStore, repoService);
+  });
 
   app.use("*", async (c, next) => {
     const rawBody = await c.req.raw.clone().text();
@@ -254,7 +309,7 @@ export async function createApp(config: AppConfig) {
     }),
   );
 
-  app.get("/deployments/:id/*", async (c) => {
+  app.all("/deployments/:id/*", async (c) => {
     const deploymentId = Number(c.req.param("id"));
     const deployment = await repoService.getDeploymentById(deploymentId);
     if (!deployment || deployment.status !== "ready") {
@@ -263,10 +318,14 @@ export async function createApp(config: AppConfig) {
     const metadata = parseBody(deployment.metadata ?? "{}");
     const preferredEntryPath = typeof metadata.entry_path === "string" ? metadata.entry_path : undefined;
     const requestedPath = extractRequestedPath(c.req.path, `/deployments/${deploymentId}`);
+    const runtimeProxy = typeof metadata.runtime_proxy_url === "string" ? metadata.runtime_proxy_url : undefined;
+    if (runtimeProxy) {
+      return proxyRuntimeRequest(c, runtimeProxy, requestedPath);
+    }
     return serveDeploymentPath(c, deployment.treeHash, requestedPath, preferredEntryPath, blobStore, repoService);
   });
 
-  app.get("/apps/:slug/*", async (c) => {
+  app.all("/apps/:slug/*", async (c) => {
     const slug = c.req.param("slug");
     const binding = await repoService.getDeploymentBySlug(slug);
     if (!binding || binding.deployment.status !== "ready") {
@@ -275,6 +334,10 @@ export async function createApp(config: AppConfig) {
     const metadata = parseBody(binding.deployment.metadata ?? "{}");
     const preferredEntryPath = typeof metadata.entry_path === "string" ? metadata.entry_path : undefined;
     const requestedPath = extractRequestedPath(c.req.path, `/apps/${slug}`);
+    const runtimeProxy = typeof metadata.runtime_proxy_url === "string" ? metadata.runtime_proxy_url : undefined;
+    if (runtimeProxy) {
+      return proxyRuntimeRequest(c, runtimeProxy, requestedPath);
+    }
     return serveDeploymentPath(c, binding.deployment.treeHash, requestedPath, preferredEntryPath, blobStore, repoService);
   });
 
@@ -1173,6 +1236,8 @@ export async function createApp(config: AppConfig) {
         file_count: fileEntries.length,
         runtime: body.data.runtime,
         framework: body.data.framework,
+        environment: body.data.environment,
+        secret_refs: body.data.secret_refs,
         dockerfile_path: body.data.dockerfile_path,
         compose_file_path: body.data.compose_file_path,
         entry_path: entryPath,
@@ -1194,6 +1259,8 @@ export async function createApp(config: AppConfig) {
         slug,
         runtime: body.data.runtime,
         framework: body.data.framework,
+        environment: body.data.environment,
+        secret_refs: body.data.secret_refs,
         entry_path: entryPath,
         dockerfile_path: body.data.dockerfile_path,
         compose_file_path: body.data.compose_file_path,
@@ -1211,6 +1278,8 @@ export async function createApp(config: AppConfig) {
       treeHash: commit.treeHash,
       entryPath,
       runtime: body.data.runtime,
+      environment: body.data.environment,
+      secretRefs: body.data.secret_refs,
       dockerfilePath: body.data.dockerfile_path,
       composeFilePath: body.data.compose_file_path,
       timeoutMs: body.data.timeout_ms,
@@ -1409,6 +1478,204 @@ export async function createApp(config: AppConfig) {
         created_at: toISOString(hook.createdAt),
       })),
     });
+  });
+
+  app.post("/v1/repos/:id/domains", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "admin");
+    if (!repoResult.ok) return repoResult.response;
+    const body = upsertDomainSchema.safeParse(parseBody(c.get("rawBody")));
+    if (!body.success) return error(c, 400, "Invalid request", body.error.message);
+
+    const deployment = await repoService.getDeployment(repoResult.repo.id, body.data.deployment_id);
+    if (!deployment) return error(c, 404, "Not found", "Deployment not found");
+    if (deployment.status !== "ready") return error(c, 409, "Resource conflict", "Deployment is not ready");
+
+    const domain = normalizeHost(body.data.domain);
+    if (!domain) return error(c, 400, "Invalid request", "domain is empty");
+
+    await repoService.upsertCustomDomain({
+      repoId: repoResult.repo.id,
+      deploymentId: body.data.deployment_id,
+      domain,
+      createdBy: c.get("agentId"),
+    });
+
+    return c.json(
+      {
+        domain,
+        deployment_id: body.data.deployment_id,
+        verified: true,
+        access_url: `http://${domain}/`,
+        dns: dnsInstructions(domain, c.req.header("host")),
+      },
+      201,
+    );
+  });
+
+  app.get("/v1/repos/:id/domains", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "read");
+    if (!repoResult.ok) return repoResult.response;
+    const rows = await repoService.listCustomDomains(repoResult.repo.id);
+    return c.json({
+      domains: rows.map((row) => ({
+        id: row.id,
+        domain: row.domain,
+        deployment_id: row.deploymentId,
+        verified: row.verified,
+        created_by: row.createdBy,
+        dns: dnsInstructions(row.domain, c.req.header("host")),
+        created_at: toISOString(row.createdAt),
+        updated_at: toISOString(row.updatedAt),
+      })),
+    });
+  });
+
+  app.delete("/v1/repos/:id/domains/:domain", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "admin");
+    if (!repoResult.ok) return repoResult.response;
+    await repoService.removeCustomDomain(repoResult.repo.id, normalizeHost(c.req.param("domain")));
+    return c.json({ success: true });
+  });
+
+  app.post("/v1/repos/:id/secrets", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "admin");
+    if (!repoResult.ok) return repoResult.response;
+    const body = upsertSecretSchema.safeParse(parseBody(c.get("rawBody")));
+    if (!body.success) return error(c, 400, "Invalid request", body.error.message);
+
+    const encrypted = encryptSecret(body.data.value);
+    await repoService.upsertSecret({
+      repoId: repoResult.repo.id,
+      key: body.data.key,
+      environment: body.data.environment,
+      encryptedValue: encrypted.encryptedValue,
+      nonce: encrypted.nonce,
+      updatedBy: c.get("agentId"),
+    });
+
+    return c.json(
+      {
+        key: body.data.key,
+        environment: body.data.environment,
+        updated_by: c.get("agentId"),
+      },
+      201,
+    );
+  });
+
+  app.get("/v1/repos/:id/secrets", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "read");
+    if (!repoResult.ok) return repoResult.response;
+    const environment = c.req.query("environment") ?? undefined;
+    const rows = await repoService.listSecrets(repoResult.repo.id, environment);
+    return c.json({
+      secrets: rows.map((row) => ({
+        key: row.key,
+        environment: row.environment,
+        updated_by: row.updatedBy,
+        created_at: toISOString(row.createdAt),
+        updated_at: toISOString(row.updatedAt),
+      })),
+    });
+  });
+
+  app.delete("/v1/repos/:id/secrets/:key", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "admin");
+    if (!repoResult.ok) return repoResult.response;
+    const environment = c.req.query("environment") ?? "dev";
+    await repoService.deleteSecret(repoResult.repo.id, environment, c.req.param("key"));
+    return c.json({ success: true });
+  });
+
+  app.post("/v1/repos/:id/jobs", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "write");
+    if (!repoResult.ok) return repoResult.response;
+    const body = runJobSchema.safeParse(parseBody(c.get("rawBody")));
+    if (!body.success) return error(c, 400, "Invalid request", body.error.message);
+
+    const branch = await repoService.getBranch(repoResult.repo.id, body.data.branch);
+    if (!branch || !branch.headCommit) return error(c, 404, "Not found", "Branch has no executable commit");
+
+    const jobId = await jobRunner.enqueue({
+      repoId: repoResult.repo.id,
+      agentId: c.get("agentId"),
+      command: body.data.command,
+      branch: body.data.branch,
+      environment: body.data.environment,
+      runtime: body.data.runtime,
+      secretRefs: body.data.secret_refs,
+      timeoutMs: body.data.timeout_ms,
+      memoryLimitMb: body.data.memory_limit_mb,
+    });
+
+    return c.json(
+      {
+        id: jobId,
+        status: "queued",
+        links: {
+          status: `/v1/repos/${repoResult.repo.id}/jobs/${jobId}`,
+          logs: `/v1/repos/${repoResult.repo.id}/jobs/${jobId}/logs`,
+          cancel: `/v1/repos/${repoResult.repo.id}/jobs/${jobId}/cancel`,
+        },
+      },
+      201,
+    );
+  });
+
+  app.get("/v1/repos/:id/jobs", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "read");
+    if (!repoResult.ok) return repoResult.response;
+    const limit = Number(c.req.query("limit") ?? "20");
+    const rows = await repoService.listRunnerJobs(repoResult.repo.id, limit);
+    return c.json({
+      jobs: rows.map((row) => ({
+        id: row.id,
+        command: row.command,
+        environment: row.environment,
+        runtime: row.runtime,
+        status: row.status,
+        exit_code: row.exitCode,
+        created_at: toISOString(row.createdAt),
+        started_at: toISOString(row.startedAt),
+        completed_at: toISOString(row.completedAt),
+      })),
+    });
+  });
+
+  app.get("/v1/repos/:id/jobs/:jobId", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "read");
+    if (!repoResult.ok) return repoResult.response;
+    const row = await repoService.getRunnerJob(repoResult.repo.id, Number(c.req.param("jobId")));
+    if (!row) return error(c, 404, "Not found", "Job not found");
+    return c.json({
+      id: row.id,
+      command: row.command,
+      environment: row.environment,
+      runtime: row.runtime,
+      status: row.status,
+      secret_refs: parseBody(row.secretRefs),
+      timeout_ms: row.timeoutMs,
+      memory_limit_mb: row.memoryLimitMb,
+      exit_code: row.exitCode,
+      created_at: toISOString(row.createdAt),
+      started_at: toISOString(row.startedAt),
+      completed_at: toISOString(row.completedAt),
+    });
+  });
+
+  app.get("/v1/repos/:id/jobs/:jobId/logs", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "read");
+    if (!repoResult.ok) return repoResult.response;
+    const row = await repoService.getRunnerJob(repoResult.repo.id, Number(c.req.param("jobId")));
+    if (!row) return error(c, 404, "Not found", "Job not found");
+    return c.json({ id: row.id, status: row.status, logs: row.logs ?? "" });
+  });
+
+  app.post("/v1/repos/:id/jobs/:jobId/cancel", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "write");
+    if (!repoResult.ok) return repoResult.response;
+    await repoService.cancelRunnerJob(Number(c.req.param("jobId")));
+    return c.json({ success: true });
   });
 
   app.post("/v1/repos/:id/collaborators", async (c) => {
@@ -1711,6 +1978,54 @@ function sanitizeSlug(value: string): string {
   return cleaned.length > 0 ? cleaned : `app-${Date.now()}`;
 }
 
+function normalizeHost(hostHeader: string | undefined): string {
+  if (!hostHeader) return "";
+  return hostHeader.split(":")[0]?.trim().toLowerCase() ?? "";
+}
+
+function dnsInstructions(domain: string, requestHostHeader?: string) {
+  const publicIPv4 = process.env.DOMAIN_A_RECORD_IP ?? "";
+  const publicIPv6 = process.env.DOMAIN_AAAA_RECORD_IP ?? "";
+  const fallbackGateway = normalizeHost(requestHostHeader) || "gateway.example.com";
+  const cnameTarget = process.env.DOMAIN_CNAME_TARGET ?? fallbackGateway;
+  const txtName = `_agent-scm.${domain}`;
+  const txtValue = process.env.DOMAIN_TXT_VERIFICATION ?? `agent-scm-verify=${domain}`;
+
+  return {
+    recommended: {
+      type: "CNAME",
+      name: domain,
+      value: cnameTarget,
+    },
+    alternatives: [
+      publicIPv4
+        ? {
+            type: "A",
+            name: domain,
+            value: publicIPv4,
+          }
+        : null,
+      publicIPv6
+        ? {
+            type: "AAAA",
+            name: domain,
+            value: publicIPv6,
+          }
+        : null,
+      {
+        type: "TXT",
+        name: txtName,
+        value: txtValue,
+      },
+    ].filter(Boolean),
+    notes: [
+      "Point your domain to the Agent-SCM gateway using CNAME or A/AAAA records.",
+      "Use the TXT record for ownership verification if your DNS policy requires it.",
+      "After DNS propagation, requests with Host=domain route to this deployment.",
+    ],
+  };
+}
+
 function defaultRepoSlug(agentId: string, repoName: string): string {
   return sanitizeSlug(`${agentId}-${repoName}`);
 }
@@ -1754,6 +2069,28 @@ function extractRequestedPath(fullPath: string, prefix: string): string {
   if (!fullPath.startsWith(prefix)) return "";
   const remainder = fullPath.slice(prefix.length);
   return remainder.replace(/^\//, "");
+}
+
+async function proxyRuntimeRequest(c: Context<AppEnv>, runtimeBaseUrl: string, requestedPath: string): Promise<Response> {
+  const incoming = new URL(c.req.url);
+  const target = new URL(runtimeBaseUrl);
+  target.pathname = requestedPath.length > 0 ? `/${requestedPath}` : "/";
+  target.search = incoming.search;
+
+  const headers = new Headers(c.req.raw.headers);
+  headers.delete("host");
+
+  const body = c.req.method === "GET" || c.req.method === "HEAD" ? undefined : c.get("rawBody");
+  const proxied = await fetch(target, {
+    method: c.req.method,
+    headers,
+    body,
+  });
+
+  return new Response(proxied.body, {
+    status: proxied.status,
+    headers: proxied.headers,
+  });
 }
 
 function inferResponseContentType(path: string): string {

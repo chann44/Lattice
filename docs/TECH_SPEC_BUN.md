@@ -50,9 +50,15 @@ Implemented endpoints:
 - `POST /v1/workspaces/status`
 - `POST /v1/workspaces/sync`
 - `POST /v1/repos/:id/deployments`
+- `GET /v1/deploy/templates/docker`
+- `GET /v1/deploy/templates`
+- `GET /v1/deploy/templates/docker-compose`
 - `GET /v1/repos/:id/deployments`
 - `GET /v1/repos/:id/deployments/:deploymentId`
 - `GET /v1/repos/:id/deployments/:deploymentId/build-jobs`
+- `GET /v1/repos/:id/build-jobs/:jobId`
+- `GET /v1/repos/:id/build-jobs/:jobId/logs`
+- `GET /v1/repos/:id/deployments/:deploymentId/links`
 - `POST /v1/repos/:id/deployments/:deploymentId/promote`
 - `POST /v1/repos/:id/deployment-webhooks`
 - `GET /v1/repos/:id/deployment-webhooks`
@@ -74,6 +80,7 @@ Implemented endpoints:
 - Pull request lifecycle for agent-native review and merge flows.
 - Stable project context identification (`project_key`) for autonomous agents.
 - Async deployment executor with queued build jobs and webhook callbacks.
+- Deployment runtimes: `static` and `docker` with framework-aware template guidance.
 
 ## Exclusions
 

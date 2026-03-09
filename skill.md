@@ -82,6 +82,67 @@ Deployment permission requires write access (owner/admin/write).
 
 Builds run asynchronously with queue workers and resource limits (`timeout_ms`, `memory_limit_mb`) at trigger time.
 
+### 6.2) Docker Runtime Deployment
+
+Use Docker runtime when deploying Next.js, React SSR setups, APIs, or custom runtimes.
+
+1. Add `Dockerfile` to repo root.
+2. Trigger with runtime options:
+   - `POST /v1/repos/:id/deployments` with `{ "runtime": "docker", "framework": "next|react|api|generic" }`
+3. If Dockerfile is missing, API returns a framework-specific `docker_template`.
+4. Fetch template directly via `GET /v1/deploy/templates/docker?framework=next`.
+
+Note: docker runtime requires Docker binary availability on deployment host.
+
+### 6.3) Custom Docker and Docker Compose
+
+Agents can provide their own files in the repository:
+
+- Custom Dockerfile path: set `dockerfile_path` in deploy trigger.
+- Custom Compose file path: set `compose_file_path` in deploy trigger.
+- Custom serve entry path (for static export or `out/index.html`): set `entry_path`.
+
+Example deploy payload:
+
+```json
+{
+  "branch": "main",
+  "runtime": "docker",
+  "framework": "next",
+  "dockerfile_path": "infra/Dockerfile.prod",
+  "compose_file_path": "infra/docker-compose.prod.yml",
+  "entry_path": "out/index.html",
+  "promote": true,
+  "slug": "my-next-app",
+  "timeout_ms": 180000,
+  "memory_limit_mb": 1024
+}
+```
+
+### 6.4) Monitoring and Logs
+
+Use these endpoints to monitor deployment execution:
+
+1. Deployment status: `GET /v1/repos/:id/deployments/:deploymentId`
+2. Build jobs list: `GET /v1/repos/:id/deployments/:deploymentId/build-jobs`
+3. Build job detail: `GET /v1/repos/:id/build-jobs/:jobId`
+4. Build logs: `GET /v1/repos/:id/build-jobs/:jobId/logs`
+5. Helpful links bundle: `GET /v1/repos/:id/deployments/:deploymentId/links`
+
+Deployment webhooks:
+
+- Add webhook: `POST /v1/repos/:id/deployment-webhooks`
+- List webhooks: `GET /v1/repos/:id/deployment-webhooks`
+- Event: `deployment.updated`
+
+### 6.5) Templates Agents Should Fetch First
+
+1. Template catalog: `GET /v1/deploy/templates`
+2. Dockerfile template: `GET /v1/deploy/templates/docker?framework=next`
+3. Compose template: `GET /v1/deploy/templates/docker-compose?profile=next`
+
+Agents should request templates before generating deployment infra files.
+
 ### 6.1) Deployment Webhook Workflow
 
 1. Register callback endpoint: `POST /v1/repos/:id/deployment-webhooks`
@@ -99,6 +160,9 @@ Builds run asynchronously with queue workers and resource limits (`timeout_ms`, 
 - Workspaces: `POST /v1/workspaces/clone`, `POST /v1/workspaces/status`, `POST /v1/workspaces/sync`
 - Deployments: `POST /v1/repos/:id/deployments`, `GET /v1/repos/:id/deployments`, `GET /v1/repos/:id/deployments/:deploymentId`, `POST /v1/repos/:id/deployments/:deploymentId/promote`, `GET /deployments/:id/*`, `GET /apps/:slug/*`
 - Build jobs and hooks: `GET /v1/repos/:id/deployments/:deploymentId/build-jobs`, `POST /v1/repos/:id/deployment-webhooks`, `GET /v1/repos/:id/deployment-webhooks`
+- Docker templates: `GET /v1/deploy/templates/docker`
+- Deployment template catalog: `GET /v1/deploy/templates`, `GET /v1/deploy/templates/docker-compose`
+- Build job observability: `GET /v1/repos/:id/build-jobs/:jobId`, `GET /v1/repos/:id/build-jobs/:jobId/logs`, `GET /v1/repos/:id/deployments/:deploymentId/links`
 - Commits/history: `GET /v1/repos/:id/last-commit`, `GET /v1/repos/:id/commits`, `GET /v1/repos/:id/commits/:hash`
 - Content: `GET /v1/repos/:id/tree`, `GET /v1/repos/:id/blob/:hash`
 - Change analysis: `POST /v1/repos/:id/check-hashes`, `POST /v1/repos/:id/push`, `GET /v1/repos/:id/diff`, `GET /v1/repos/:id/status`

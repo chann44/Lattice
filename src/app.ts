@@ -130,6 +130,11 @@ const triggerDeploymentSchema = z.object({
   branch: z.string().optional().default("main"),
   promote: z.boolean().optional().default(true),
   slug: z.string().optional(),
+  runtime: z.enum(["static", "docker"]).optional().default("static"),
+  framework: z.enum(["react", "next", "api", "generic"]).optional().default("generic"),
+  entry_path: z.string().optional(),
+  dockerfile_path: z.string().optional(),
+  compose_file_path: z.string().optional(),
   timeout_ms: z.number().int().min(10_000).max(600_000).optional().default(120_000),
   memory_limit_mb: z.number().int().min(128).max(4096).optional().default(512),
 });
@@ -168,6 +173,7 @@ export async function createApp(config: AppConfig) {
       c.req.path === "/health" ||
       c.req.path === "/metrics" ||
       c.req.path === "/skills" ||
+      c.req.path.startsWith("/v1/deploy/templates") ||
       c.req.path === "/v1/register" ||
       c.req.path.startsWith("/deployments/") ||
       c.req.path.startsWith("/apps/")
@@ -222,14 +228,42 @@ export async function createApp(config: AppConfig) {
     });
   });
 
+  app.get("/v1/deploy/templates/docker", async (c) => {
+    const frameworkQuery = c.req.query("framework");
+    const framework = frameworkQuery === "react" || frameworkQuery === "next" || frameworkQuery === "api" ? frameworkQuery : "generic";
+    const template = dockerTemplate(framework);
+    return c.json({ framework, dockerfile: template });
+  });
+
+  app.get("/v1/deploy/templates/docker-compose", async (c) => {
+    const profileQuery = c.req.query("profile");
+    const profile = profileQuery === "next" || profileQuery === "api" ? profileQuery : "generic";
+    return c.json({ profile, compose: dockerComposeTemplate(profile) });
+  });
+
+  app.get("/v1/deploy/templates", (c) =>
+    c.json({
+      templates: {
+        docker: ["react", "next", "api", "generic"],
+        docker_compose: ["next", "api", "generic"],
+      },
+      endpoints: {
+        docker: "/v1/deploy/templates/docker?framework=<react|next|api|generic>",
+        docker_compose: "/v1/deploy/templates/docker-compose?profile=<next|api|generic>",
+      },
+    }),
+  );
+
   app.get("/deployments/:id/*", async (c) => {
     const deploymentId = Number(c.req.param("id"));
     const deployment = await repoService.getDeploymentById(deploymentId);
     if (!deployment || deployment.status !== "ready") {
       return error(c, 404, "Not found", "Deployment not found");
     }
+    const metadata = parseBody(deployment.metadata ?? "{}");
+    const preferredEntryPath = typeof metadata.entry_path === "string" ? metadata.entry_path : undefined;
     const requestedPath = extractRequestedPath(c.req.path, `/deployments/${deploymentId}`);
-    return serveDeploymentPath(c, deployment.treeHash, requestedPath, blobStore, repoService);
+    return serveDeploymentPath(c, deployment.treeHash, requestedPath, preferredEntryPath, blobStore, repoService);
   });
 
   app.get("/apps/:slug/*", async (c) => {
@@ -238,9 +272,12 @@ export async function createApp(config: AppConfig) {
     if (!binding || binding.deployment.status !== "ready") {
       return error(c, 404, "Not found", "App not found");
     }
+    const metadata = parseBody(binding.deployment.metadata ?? "{}");
+    const preferredEntryPath = typeof metadata.entry_path === "string" ? metadata.entry_path : undefined;
     const requestedPath = extractRequestedPath(c.req.path, `/apps/${slug}`);
-    return serveDeploymentPath(c, binding.deployment.treeHash, requestedPath, blobStore, repoService);
+    return serveDeploymentPath(c, binding.deployment.treeHash, requestedPath, preferredEntryPath, blobStore, repoService);
   });
+
 
   app.post("/v1/register", async (c) => {
     const parsed = registerSchema.safeParse(parseBody(c.get("rawBody")));
@@ -1082,10 +1119,45 @@ export async function createApp(config: AppConfig) {
 
     const entries = await repoService.getTree(commit.treeHash);
     const fileEntries = entries.filter((entry) => entry.kind !== "dir");
-    const entryPath = resolveEntrypoint(fileEntries.map((entry) => entry.path));
+    let entryPath: string | null = null;
 
-    if (!entryPath) {
-      return error(c, 409, "Resource conflict", "No deployable entrypoint found (index.html or README.md)");
+    if (body.data.entry_path) {
+      const exists = fileEntries.some((entry) => entry.path === body.data.entry_path);
+      if (!exists) {
+        return error(c, 409, "Resource conflict", `entry_path ${body.data.entry_path} does not exist in commit tree`);
+      }
+      entryPath = body.data.entry_path;
+    }
+
+    if (body.data.runtime === "docker") {
+      const dockerfilePath = body.data.dockerfile_path ?? "Dockerfile";
+      const hasDockerfile = fileEntries.some((entry) => entry.path === dockerfilePath);
+      if (!hasDockerfile) {
+        return c.json(
+          {
+            error: {
+              code: 409,
+              message: "Docker runtime requested but Dockerfile is missing",
+              details: `Add ${dockerfilePath} to repo or use static runtime`,
+            },
+            docker_template: dockerTemplate(body.data.framework),
+            docker_compose_template: dockerComposeTemplate(body.data.framework === "next" ? "next" : body.data.framework === "api" ? "api" : "generic"),
+          },
+          409,
+        );
+      }
+      if (body.data.compose_file_path) {
+        const hasComposeFile = fileEntries.some((entry) => entry.path === body.data.compose_file_path);
+        if (!hasComposeFile) {
+          return error(c, 409, "Resource conflict", `compose_file_path ${body.data.compose_file_path} does not exist`);
+        }
+      }
+      entryPath = entryPath ?? dockerfilePath;
+    } else {
+      entryPath = entryPath ?? resolveEntrypoint(fileEntries.map((entry) => entry.path));
+      if (!entryPath) {
+        return error(c, 409, "Resource conflict", "No deployable entrypoint found (index.html or README.md)");
+      }
     }
 
     const deploymentId = await repoService.createDeployment({
@@ -1097,7 +1169,14 @@ export async function createApp(config: AppConfig) {
       status: "building",
       entryPath,
       logs: "Build queued",
-      metadata: { file_count: fileEntries.length },
+      metadata: {
+        file_count: fileEntries.length,
+        runtime: body.data.runtime,
+        framework: body.data.framework,
+        dockerfile_path: body.data.dockerfile_path,
+        compose_file_path: body.data.compose_file_path,
+        entry_path: entryPath,
+      },
     });
 
     if (!deploymentId) {
@@ -1110,7 +1189,15 @@ export async function createApp(config: AppConfig) {
 
     await repoService.updateDeployment(deploymentId, {
       publicUrl: deploymentUrl,
-      metadata: { file_count: fileEntries.length, slug },
+      metadata: {
+        file_count: fileEntries.length,
+        slug,
+        runtime: body.data.runtime,
+        framework: body.data.framework,
+        entry_path: entryPath,
+        dockerfile_path: body.data.dockerfile_path,
+        compose_file_path: body.data.compose_file_path,
+      },
       logs: "Build queued",
     });
 
@@ -1123,6 +1210,9 @@ export async function createApp(config: AppConfig) {
       deploymentId,
       treeHash: commit.treeHash,
       entryPath,
+      runtime: body.data.runtime,
+      dockerfilePath: body.data.dockerfile_path,
+      composeFilePath: body.data.compose_file_path,
       timeoutMs: body.data.timeout_ms,
       memoryLimitMb: body.data.memory_limit_mb,
     });
@@ -1137,6 +1227,12 @@ export async function createApp(config: AppConfig) {
         deployment_url: deploymentUrl,
         app_url: appUrl,
         promoted: body.data.promote,
+        links: {
+          status: `/v1/repos/${repoResult.repo.id}/deployments/${deploymentId}`,
+          logs: `/v1/repos/${repoResult.repo.id}/deployments/${deploymentId}/build-jobs`,
+          immutable: `${deploymentUrl}/`,
+          promoted: `${appUrl}/`,
+        },
       },
       201,
     );
@@ -1178,8 +1274,32 @@ export async function createApp(config: AppConfig) {
       public_url: deployment.publicUrl,
       metadata: parseBody(deployment.metadata ?? "{}"),
       logs: deployment.logs,
+      links: {
+        immutable: `${deployment.publicUrl ?? `/deployments/${deployment.id}`}/`,
+      },
       created_at: toISOString(deployment.createdAt),
       updated_at: toISOString(deployment.updatedAt),
+    });
+  });
+
+  app.get("/v1/repos/:id/deployments/:deploymentId/links", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "read");
+    if (!repoResult.ok) return repoResult.response;
+    const deploymentId = Number(c.req.param("deploymentId"));
+    const deployment = await repoService.getDeployment(repoResult.repo.id, deploymentId);
+    if (!deployment) return error(c, 404, "Not found", "Deployment not found");
+
+    const metadata = parseBody(deployment.metadata ?? "{}");
+    const slug = typeof metadata.slug === "string" ? metadata.slug : defaultRepoSlug(repoResult.repo.agentId, repoResult.repo.name);
+
+    return c.json({
+      deployment_id: deployment.id,
+      links: {
+        status: `/v1/repos/${repoResult.repo.id}/deployments/${deployment.id}`,
+        build_jobs: `/v1/repos/${repoResult.repo.id}/deployments/${deployment.id}/build-jobs`,
+        immutable: `${deployment.publicUrl ?? `/deployments/${deployment.id}`}/`,
+        promoted: `/apps/${slug}/`,
+      },
     });
   });
 
@@ -1223,6 +1343,39 @@ export async function createApp(config: AppConfig) {
         completed_at: toISOString(job.completedAt),
         created_at: toISOString(job.createdAt),
       })),
+    });
+  });
+
+  app.get("/v1/repos/:id/build-jobs/:jobId", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "read");
+    if (!repoResult.ok) return repoResult.response;
+    const jobId = Number(c.req.param("jobId"));
+    const row = await repoService.getBuildJobForRepo(repoResult.repo.id, jobId);
+    if (!row) return error(c, 404, "Not found", "Build job not found");
+    return c.json({
+      id: row.job.id,
+      deployment_id: row.deployment.id,
+      deployment_status: row.deployment.status,
+      status: row.job.status,
+      timeout_ms: row.job.timeoutMs,
+      memory_limit_mb: row.job.memoryLimitMb,
+      started_at: toISOString(row.job.startedAt),
+      completed_at: toISOString(row.job.completedAt),
+      created_at: toISOString(row.job.createdAt),
+    });
+  });
+
+  app.get("/v1/repos/:id/build-jobs/:jobId/logs", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "read");
+    if (!repoResult.ok) return repoResult.response;
+    const jobId = Number(c.req.param("jobId"));
+    const row = await repoService.getBuildJobForRepo(repoResult.repo.id, jobId);
+    if (!row) return error(c, 404, "Not found", "Build job not found");
+    return c.json({
+      id: row.job.id,
+      deployment_id: row.deployment.id,
+      status: row.job.status,
+      logs: row.job.logs ?? "",
     });
   });
 
@@ -1566,11 +1719,12 @@ async function serveDeploymentPath(
   c: Context<AppEnv>,
   treeHash: string,
   requestedPath: string,
+  preferredEntryPath: string | undefined,
   blobStore: BlobStore,
   repoService: RepositoryService,
 ) {
   const entries = await repoService.getTree(treeHash);
-  const requested = requestedPath.length > 0 ? requestedPath.replace(/^\//, "") : "index.html";
+  const requested = requestedPath.length > 0 ? requestedPath.replace(/^\//, "") : preferredEntryPath ?? "index.html";
 
   const byPath = new Map(entries.map((entry) => [entry.path, entry]));
   let entry = byPath.get(requested);
@@ -1591,7 +1745,7 @@ async function serveDeploymentPath(
   return new Response(content, {
     status: 200,
     headers: {
-      "Content-Type": entry.content_type ?? inferResponseContentType(entry.path),
+      "Content-Type": inferResponseContentType(entry.path),
     },
   });
 }
@@ -1612,4 +1766,87 @@ function inferResponseContentType(path: string): string {
   if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
   if (path.endsWith(".md")) return "text/markdown; charset=utf-8";
   return "text/plain; charset=utf-8";
+}
+
+function dockerTemplate(framework: "react" | "next" | "api" | "generic"): string {
+  if (framework === "react") {
+    return [
+      "FROM oven/bun:1.2.20",
+      "WORKDIR /app",
+      "COPY package.json bun.lock* ./",
+      "RUN bun install --frozen-lockfile",
+      "COPY . .",
+      "RUN bun build index.html --outdir ./dist",
+      "EXPOSE 8080",
+      "CMD [\"bun\", \"x\", \"serve\", \"dist\", \"-l\", \"8080\"]",
+    ].join("\n");
+  }
+  if (framework === "next") {
+    return [
+      "FROM oven/bun:1.2.20",
+      "WORKDIR /app",
+      "COPY package.json bun.lock* ./",
+      "RUN bun install --frozen-lockfile",
+      "COPY . .",
+      "RUN bun run build",
+      "EXPOSE 3000",
+      "CMD [\"bun\", \"run\", \"start\"]",
+    ].join("\n");
+  }
+  if (framework === "api") {
+    return [
+      "FROM oven/bun:1.2.20",
+      "WORKDIR /app",
+      "COPY package.json bun.lock* ./",
+      "RUN bun install --frozen-lockfile",
+      "COPY . .",
+      "EXPOSE 8080",
+      "CMD [\"bun\", \"index.ts\"]",
+    ].join("\n");
+  }
+  return [
+    "FROM oven/bun:1.2.20",
+    "WORKDIR /app",
+    "COPY . .",
+    "EXPOSE 8080",
+    "CMD [\"bun\", \"index.ts\"]",
+  ].join("\n");
+}
+
+function dockerComposeTemplate(profile: "next" | "api" | "generic"): string {
+  if (profile === "next") {
+    return [
+      "services:",
+      "  web:",
+      "    build:",
+      "      context: .",
+      "      dockerfile: Dockerfile",
+      "    ports:",
+      "      - \"3000:3000\"",
+      "    environment:",
+      "      - NODE_ENV=production",
+      "    restart: unless-stopped",
+    ].join("\n");
+  }
+  if (profile === "api") {
+    return [
+      "services:",
+      "  api:",
+      "    build:",
+      "      context: .",
+      "      dockerfile: Dockerfile",
+      "    ports:",
+      "      - \"8080:8080\"",
+      "    restart: unless-stopped",
+    ].join("\n");
+  }
+  return [
+    "services:",
+    "  app:",
+    "    build:",
+    "      context: .",
+    "      dockerfile: Dockerfile",
+    "    ports:",
+    "      - \"8080:8080\"",
+  ].join("\n");
 }

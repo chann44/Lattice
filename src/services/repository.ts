@@ -478,6 +478,16 @@ export class RepositoryService {
     return this.db.select().from(buildJobs).where(eq(buildJobs.deploymentId, deploymentId)).orderBy(desc(buildJobs.createdAt));
   }
 
+  async getBuildJobForRepo(repoId: number, jobId: number) {
+    const rows = await this.db
+      .select({ job: buildJobs, deployment: deployments })
+      .from(buildJobs)
+      .innerJoin(deployments, eq(deployments.id, buildJobs.deploymentId))
+      .where(and(eq(buildJobs.id, jobId), eq(deployments.repoId, repoId)))
+      .limit(1);
+    return rows[0] ?? null;
+  }
+
   async addDeploymentWebhook(repoId: number, url: string, secret?: string) {
     const rows = await this.db
       .insert(deploymentWebhooks)

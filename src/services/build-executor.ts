@@ -10,6 +10,9 @@ type BuildJobInput = {
   deploymentId: number;
   treeHash: string;
   entryPath: string;
+  runtime: "static" | "docker";
+  dockerfilePath?: string;
+  composeFilePath?: string;
   timeoutMs: number;
   memoryLimitMb: number;
 };
@@ -80,7 +83,42 @@ export class BuildExecutor {
       }
 
       const buildCommand = this.resolveBuildCommand(item.entryPath);
-      if (buildCommand) {
+      if (item.runtime === "docker") {
+        logs += "Docker runtime selected\n";
+        const dockerVersion = Bun.spawnSync(["docker", "--version"], { stdout: "pipe", stderr: "pipe" });
+        if (dockerVersion.exitCode !== 0) {
+          throw new Error("docker binary is not available on this host");
+        }
+
+        logs += "Running docker build\n";
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), item.timeoutMs);
+        try {
+          const tag = `agent-scm-${item.deploymentId}`;
+          const command = item.composeFilePath
+            ? ["docker", "compose", "-f", item.composeFilePath, "build"]
+            : ["docker", "build", "-t", tag, "-f", item.dockerfilePath ?? "Dockerfile", "."];
+          const proc = Bun.spawn(command, {
+            cwd: workDir,
+            stdout: "pipe",
+            stderr: "pipe",
+            signal: ac.signal,
+          });
+          const [stdout, stderr, exitCode] = await Promise.all([
+            new Response(proc.stdout).text(),
+            new Response(proc.stderr).text(),
+            proc.exited,
+          ]);
+          logs += stdout;
+          logs += stderr;
+          if (exitCode !== 0) {
+            throw new Error(`docker build failed with code ${exitCode}`);
+          }
+          logs += `Docker image built: ${tag}\n`;
+        } finally {
+          clearTimeout(timer);
+        }
+      } else if (buildCommand) {
         logs += `Running build for ${item.entryPath}\n`;
         const timeoutPromise = new Promise<never>((_, reject) => {
           setTimeout(() => reject(new Error("build timed out")), item.timeoutMs);

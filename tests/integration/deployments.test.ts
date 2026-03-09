@@ -100,9 +100,32 @@ describe("deployments workflow", () => {
       headers: { Authorization: signAuth(owner.agentId, owner.secretKey) },
     });
     expect(jobsRes.status).toBe(200);
-    const jobs = (await jobsRes.json()) as { build_jobs: Array<{ status: string; logs: string }> };
+    const jobs = (await jobsRes.json()) as { build_jobs: Array<{ id: number; status: string; logs: string }> };
     expect(jobs.build_jobs.length).toBeGreaterThan(0);
     expect(jobs.build_jobs[0]?.status).toBe("ready");
+
+    const firstJobId = jobs.build_jobs[0]?.id;
+    expect(firstJobId).toBeDefined();
+
+    const jobDetailRes = await app.request(`http://localhost/v1/repos/${repo.id}/build-jobs/${firstJobId}`, {
+      headers: { Authorization: signAuth(owner.agentId, owner.secretKey) },
+    });
+    expect(jobDetailRes.status).toBe(200);
+
+    const jobLogsRes = await app.request(`http://localhost/v1/repos/${repo.id}/build-jobs/${firstJobId}/logs`, {
+      headers: { Authorization: signAuth(owner.agentId, owner.secretKey) },
+    });
+    expect(jobLogsRes.status).toBe(200);
+    const jobLogs = (await jobLogsRes.json()) as { logs: string };
+    expect(jobLogs.logs.length).toBeGreaterThan(0);
+
+    const linksRes = await app.request(`http://localhost/v1/repos/${repo.id}/deployments/${deployment.id}/links`, {
+      headers: { Authorization: signAuth(owner.agentId, owner.secretKey) },
+    });
+    expect(linksRes.status).toBe(200);
+    const links = (await linksRes.json()) as { links: { promoted: string; immutable: string } };
+    expect(links.links.promoted).toContain("/apps/");
+    expect(links.links.immutable).toContain("/deployments/");
 
     const immutableIndex = await app.request(`http://localhost${deployment.deployment_url}/index.html`);
     expect(immutableIndex.status).toBe(200);
@@ -164,5 +187,45 @@ describe("deployments workflow", () => {
     } finally {
       receiver.stop(true);
     }
+  });
+
+  test("returns docker template guidance when Dockerfile is missing", async () => {
+    const { identity: owner } = await registerAgent(app, { name: "docker-template-owner" });
+    const repo = await createRepo(app, owner, "docker-template-repo");
+    await pushSnapshot(app, owner, repo.id, { "index.html": "<html><body>hello</body></html>" }, "main");
+
+    const triggerBody = {
+      branch: "main",
+      runtime: "docker" as const,
+      framework: "next" as const,
+      dockerfile_path: "infra/Dockerfile.prod",
+      compose_file_path: "infra/docker-compose.prod.yml",
+      promote: false,
+    };
+    const trigger = await app.request(`http://localhost/v1/repos/${repo.id}/deployments`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: signAuth(owner.agentId, owner.secretKey, triggerBody),
+      },
+      body: JSON.stringify(triggerBody),
+    });
+    expect(trigger.status).toBe(409);
+    const payload = (await trigger.json()) as { docker_template?: string; docker_compose_template?: string };
+    expect(payload.docker_template).toContain("bun run build");
+    expect(payload.docker_compose_template).toContain("services:");
+
+    const catalog = await app.request("http://localhost/v1/deploy/templates");
+    expect(catalog.status).toBe(200);
+
+    const template = await app.request("http://localhost/v1/deploy/templates/docker?framework=react");
+    expect(template.status).toBe(200);
+    const templateJson = (await template.json()) as { dockerfile: string };
+    expect(templateJson.dockerfile).toContain("bun build index.html");
+
+    const composeTemplate = await app.request("http://localhost/v1/deploy/templates/docker-compose?profile=next");
+    expect(composeTemplate.status).toBe(200);
+    const composeJson = (await composeTemplate.json()) as { compose: string };
+    expect(composeJson.compose).toContain("services:");
   });
 });

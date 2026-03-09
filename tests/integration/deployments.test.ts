@@ -5,6 +5,29 @@ import { join } from "node:path";
 import { createApp } from "../../src/app";
 import { createRepo, pushSnapshot, registerAgent, signAuth } from "../helpers/client";
 
+async function waitForDeploymentReady(
+  app: Awaited<ReturnType<typeof createApp>>["app"],
+  repoId: number,
+  deploymentId: number,
+  authHeader: string,
+): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < 10_000) {
+    const statusRes = await app.request(`http://localhost/v1/repos/${repoId}/deployments/${deploymentId}`, {
+      headers: { Authorization: authHeader },
+    });
+    if (statusRes.status !== 200) {
+      await Bun.sleep(100);
+      continue;
+    }
+    const status = (await statusRes.json()) as { status: string };
+    if (status.status === "ready") return;
+    if (status.status === "failed") throw new Error("deployment failed");
+    await Bun.sleep(100);
+  }
+  throw new Error("deployment did not become ready in time");
+}
+
 describe("deployments workflow", () => {
   let app: Awaited<ReturnType<typeof createApp>>["app"];
 
@@ -71,12 +94,15 @@ describe("deployments workflow", () => {
     expect(deployRes.status).toBe(201);
     const deployment = (await deployRes.json()) as { id: number; app_url: string; deployment_url: string };
 
-    const statusRes = await app.request(`http://localhost/v1/repos/${repo.id}/deployments/${deployment.id}`, {
+    await waitForDeploymentReady(app, repo.id, deployment.id, signAuth(owner.agentId, owner.secretKey));
+
+    const jobsRes = await app.request(`http://localhost/v1/repos/${repo.id}/deployments/${deployment.id}/build-jobs`, {
       headers: { Authorization: signAuth(owner.agentId, owner.secretKey) },
     });
-    expect(statusRes.status).toBe(200);
-    const status = (await statusRes.json()) as { status: string };
-    expect(status.status).toBe("ready");
+    expect(jobsRes.status).toBe(200);
+    const jobs = (await jobsRes.json()) as { build_jobs: Array<{ status: string; logs: string }> };
+    expect(jobs.build_jobs.length).toBeGreaterThan(0);
+    expect(jobs.build_jobs[0]?.status).toBe("ready");
 
     const immutableIndex = await app.request(`http://localhost${deployment.deployment_url}/index.html`);
     expect(immutableIndex.status).toBe(200);
@@ -89,5 +115,54 @@ describe("deployments workflow", () => {
     const promotedAsset = await app.request(`http://localhost${deployment.app_url}/assets/app.js`);
     expect(promotedAsset.status).toBe(200);
     expect(await promotedAsset.text()).toContain("console.log");
+  });
+
+  test("sends deployment webhooks on status updates", async () => {
+    const { identity: owner } = await registerAgent(app, { name: "deploy-webhook-owner" });
+    const repo = await createRepo(app, owner, "deploy-webhook-repo");
+
+    await pushSnapshot(app, owner, repo.id, { "index.html": "<html>Webhook</html>" }, "main");
+
+    const events: Array<{ event: string; status: string }> = [];
+    const receiver = Bun.serve({
+      port: 0,
+      fetch: async (request) => {
+        const payload = (await request.json()) as { event: string; status: string };
+        events.push({ event: payload.event, status: payload.status });
+        return new Response("ok");
+      },
+    });
+
+    try {
+      const webhookBody = { url: `http://127.0.0.1:${receiver.port}/hook`, secret: "topsecret" };
+      const addWebhook = await app.request(`http://localhost/v1/repos/${repo.id}/deployment-webhooks`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: signAuth(owner.agentId, owner.secretKey, webhookBody),
+        },
+        body: JSON.stringify(webhookBody),
+      });
+      expect(addWebhook.status).toBe(201);
+
+      const deployBody = { branch: "main", promote: false, slug: "webhook-app" };
+      const deployRes = await app.request(`http://localhost/v1/repos/${repo.id}/deployments`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: signAuth(owner.agentId, owner.secretKey, deployBody),
+        },
+        body: JSON.stringify(deployBody),
+      });
+      expect(deployRes.status).toBe(201);
+      const deployment = (await deployRes.json()) as { id: number };
+
+      await waitForDeploymentReady(app, repo.id, deployment.id, signAuth(owner.agentId, owner.secretKey));
+
+      expect(events.length).toBeGreaterThan(0);
+      expect(events.some((event) => event.event === "deployment.updated" && event.status === "ready")).toBeTrue();
+    } finally {
+      receiver.stop(true);
+    }
   });
 });

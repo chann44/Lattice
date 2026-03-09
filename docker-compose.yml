@@ -1,0 +1,15 @@
+services:
+  agent-scm:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    environment:
+      - PORT=8080
+      - DB_PATH=/data/agent-scm.db
+      - BLOBS_DIR=/data/blobs
+      - RATE_LIMIT=100
+      - MAX_BLOB_SIZE=52428800
+      - MAX_REQUEST_AGE=300
+    restart: unless-stopped

@@ -3,8 +3,11 @@ export type VersionBump = "MAJOR" | "MINOR" | "PATCH";
 export type TreeEntry = {
   path: string;
   hash: string;
-  mode: "file" | "executable";
+  kind: "file" | "dir" | "symlink";
+  mode: "100644" | "100755" | "120000" | "040000";
   size?: number;
+  is_binary?: boolean;
+  content_type?: string;
 };
 
 export type FileDiff = {

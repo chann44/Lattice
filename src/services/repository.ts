@@ -420,7 +420,7 @@ export class RepositoryService {
     const commit = await this.getCommit(commitHash);
     if (!commit) return {};
     const entries = await this.getTree(commit.treeHash);
-    return Object.fromEntries(entries.map((entry) => [entry.path, entry.hash]));
+    return Object.fromEntries(entries.filter((entry) => entry.kind !== "dir").map((entry) => [entry.path, entry.hash]));
   }
 
   async decodeCommitMetadata(commitHash: string): Promise<Record<string, unknown>> {

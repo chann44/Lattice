@@ -41,7 +41,17 @@ const createRepoSchema = z.object({
 
 const pushSchema = z.object({
   branch: z.string().optional().default("main"),
-  files: z.record(z.string(), z.string()),
+  files: z.record(
+    z.string(),
+    z.union([
+      z.string(),
+      z.object({
+        content: z.string(),
+        mode: z.enum(["100644", "100755", "120000"]).optional().default("100644"),
+        kind: z.enum(["file", "symlink"]).optional().default("file"),
+      }),
+    ]),
+  ),
   message: z.string().optional(),
 });
 
@@ -95,6 +105,24 @@ const mergePullRequestSchema = z.object({
 const reviewPullRequestSchema = z.object({
   decision: z.enum(["approve", "request_changes", "comment"]),
   comment: z.string().optional().default(""),
+});
+
+const cloneWorkspaceSchema = z.object({
+  project_key: z.string().min(1),
+  branch: z.string().optional().default("main"),
+  create_if_missing: z.boolean().optional().default(false),
+  repo_name: z.string().optional(),
+  description: z.string().optional().default(""),
+  workspace_path: z.string().optional(),
+  fingerprint: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional().default({}),
+});
+
+const workspaceStatusSchema = z.object({
+  repo_id: z.number().int().positive(),
+  branch: z.string().optional().default("main"),
+  local_hashes: z.record(z.string(), z.string()),
+  local_head_commit: z.string().optional(),
 });
 
 const metrics = {
@@ -456,6 +484,155 @@ export async function createApp(config: AppConfig) {
     });
   });
 
+  app.post("/v1/workspaces/clone", async (c) => {
+    const body = cloneWorkspaceSchema.safeParse(parseBody(c.get("rawBody")));
+    if (!body.success) return error(c, 400, "Invalid request", body.error.message);
+
+    const existing = await repoService.getProjectContext(c.get("agentId"), body.data.project_key);
+    let repo = existing ? await repoService.getRepo(existing.repoId) : null;
+
+    if (!repo && body.data.create_if_missing) {
+      const repoName = body.data.repo_name && body.data.repo_name.trim() ? body.data.repo_name : sanitizeRepoName(body.data.project_key);
+      const repoId = await repoService.createRepo(c.get("agentId"), repoName, body.data.description, body.data.branch);
+      await repoService.upsertProjectContext({
+        agentId: c.get("agentId"),
+        repoId,
+        projectKey: body.data.project_key,
+        workspacePath: body.data.workspace_path,
+        fingerprint: body.data.fingerprint,
+        metadata: body.data.metadata,
+      });
+      repo = await repoService.getRepo(repoId);
+    }
+
+    if (!repo) {
+      return error(c, 404, "Not found", "Project/repository not found");
+    }
+
+    const access = await repoService.getRepoAccess(c.get("agentId"), repo.id);
+    if (!hasAccess(access, "read")) {
+      return error(c, 403, "Forbidden", "No access to repository");
+    }
+
+    const branch = (await repoService.getBranch(repo.id, body.data.branch)) ?? (await repoService.getBranch(repo.id, repo.defaultBranch));
+    const head = branch?.headCommit ?? null;
+    const commit = head ? await repoService.getCommit(head) : null;
+    const entries = commit ? await repoService.getTree(commit.treeHash) : [];
+    const files = await materializeFiles(entries, blobStore);
+
+    return c.json({
+      repo: {
+        id: repo.id,
+        name: repo.name,
+        namespace: `${repo.agentId}/${repo.name}`,
+        default_branch: repo.defaultBranch,
+      },
+      branch: branch?.name ?? repo.defaultBranch,
+      head_commit: head,
+      tree_hash: commit?.treeHash ?? null,
+      entries,
+      files,
+      state: {
+        project_key: body.data.project_key,
+        repo_id: repo.id,
+        branch: branch?.name ?? repo.defaultBranch,
+        head_commit: head,
+        tree_hash: commit?.treeHash ?? null,
+        last_sync_at: new Date().toISOString(),
+      },
+    });
+  });
+
+  app.post("/v1/workspaces/status", async (c) => {
+    const body = workspaceStatusSchema.safeParse(parseBody(c.get("rawBody")));
+    if (!body.success) return error(c, 400, "Invalid request", body.error.message);
+
+    const access = await repoService.getRepoAccess(c.get("agentId"), body.data.repo_id);
+    if (!hasAccess(access, "read")) return error(c, 403, "Forbidden", "No access to repository");
+
+    const branch = await repoService.getBranch(body.data.repo_id, body.data.branch);
+    if (!branch) return error(c, 404, "Not found", "Branch not found");
+    const remoteMap = await repoService.buildTreeMap(branch.headCommit);
+    const localMap = body.data.local_hashes;
+
+    const added = Object.keys(localMap).filter((path) => !remoteMap[path]);
+    const modified = Object.keys(localMap).filter((path) => remoteMap[path] && remoteMap[path] !== localMap[path]);
+    const deleted = Object.keys(remoteMap).filter((path) => !localMap[path]);
+    const headMismatch = body.data.local_head_commit ? body.data.local_head_commit !== branch.headCommit : Boolean(branch.headCommit);
+    const behind = headMismatch || added.length > 0 || modified.length > 0 || deleted.length > 0;
+
+    return c.json({
+      repo_id: body.data.repo_id,
+      branch: branch.name,
+      remote_head_commit: branch.headCommit,
+      local_head_commit: body.data.local_head_commit ?? null,
+      diverged: behind && (added.length > 0 || modified.length > 0 || deleted.length > 0),
+      behind,
+      summary: {
+        added: added.length,
+        modified: modified.length,
+        deleted: deleted.length,
+      },
+      changes: {
+        added,
+        modified,
+        deleted,
+      },
+    });
+  });
+
+  app.post("/v1/workspaces/sync", async (c) => {
+    const body = workspaceStatusSchema.safeParse(parseBody(c.get("rawBody")));
+    if (!body.success) return error(c, 400, "Invalid request", body.error.message);
+
+    const access = await repoService.getRepoAccess(c.get("agentId"), body.data.repo_id);
+    if (!hasAccess(access, "read")) return error(c, 403, "Forbidden", "No access to repository");
+
+    const branch = await repoService.getBranch(body.data.repo_id, body.data.branch);
+    if (!branch) return error(c, 404, "Not found", "Branch not found");
+
+    const commit = branch.headCommit ? await repoService.getCommit(branch.headCommit) : null;
+    if (!commit) {
+      return c.json({
+        repo_id: body.data.repo_id,
+        branch: body.data.branch,
+        head_commit: null,
+        tree_hash: null,
+        changed_files: {},
+        deleted_paths: [],
+      });
+    }
+
+    const entries = await repoService.getTree(commit.treeHash);
+    const remoteMap = Object.fromEntries(entries.filter((entry) => entry.kind !== "dir").map((entry) => [entry.path, entry.hash]));
+
+    const changedPaths = Object.keys(remoteMap).filter((path) => body.data.local_hashes[path] !== remoteMap[path]);
+    const deletedPaths = Object.keys(body.data.local_hashes).filter((path) => !remoteMap[path]);
+
+    const changedFiles: Record<string, string> = {};
+    for (const path of changedPaths) {
+      const hash = remoteMap[path];
+      if (!hash) continue;
+      changedFiles[path] = await blobStore.read(hash);
+    }
+
+    return c.json({
+      repo_id: body.data.repo_id,
+      branch: body.data.branch,
+      head_commit: commit.hash,
+      tree_hash: commit.treeHash,
+      changed_files: changedFiles,
+      deleted_paths: deletedPaths,
+      state: {
+        repo_id: body.data.repo_id,
+        branch: body.data.branch,
+        head_commit: commit.hash,
+        tree_hash: commit.treeHash,
+        last_sync_at: new Date().toISOString(),
+      },
+    });
+  });
+
   app.get("/v1/repos/:id/project-context", async (c) => {
     const repoResult = await authorizedRepo(c, repoService, "read");
     if (!repoResult.ok) return repoResult.response;
@@ -498,10 +675,18 @@ export async function createApp(config: AppConfig) {
     if (!body.success) return error(c, 400, "Invalid files", body.error.message);
     if (Object.keys(body.data.files).length === 0) return error(c, 400, "Invalid files", "files cannot be empty");
 
+    const normalizedFiles: Record<string, { content: string; mode: "100644" | "100755" | "120000"; kind: "file" | "symlink" }> =
+      Object.fromEntries(
+        Object.entries(body.data.files).map(([path, file]) => [
+          path,
+          typeof file === "string" ? { content: file, mode: "100644", kind: "file" as const } : file,
+        ]),
+      );
+
     let totalBytes = 0;
-    for (const [path, content] of Object.entries(body.data.files)) {
+    for (const [path, file] of Object.entries(normalizedFiles)) {
       if (path.includes("..")) return error(c, 400, "Invalid files", `invalid path ${path}`);
-      totalBytes += new TextEncoder().encode(content).byteLength;
+      totalBytes += new TextEncoder().encode(file.content).byteLength;
     }
     if (totalBytes > config.maxBlobSize) return error(c, 413, "Payload too large", "Payload exceeds max blob size");
 
@@ -509,22 +694,22 @@ export async function createApp(config: AppConfig) {
     if (!sourceBranch) return error(c, 404, "Not found", "Branch not found");
 
     const fileHashes: Record<string, string> = {};
-    for (const [path, content] of Object.entries(body.data.files)) {
-      const hash = sha256Hex(content);
+    for (const [path, file] of Object.entries(normalizedFiles)) {
+      const hash = sha256Hex(file.content);
       fileHashes[path] = hash;
       const exists = (await repoService.blobExists(hash)) && (await blobStore.exists(hash));
       if (!exists) {
-        await blobStore.write(hash, content);
+        await blobStore.write(hash, file.content);
       }
-      await repoService.insertBlob(hash, content.length);
+      await repoService.insertBlob(hash, file.content.length);
     }
 
-    const entries = createTreeEntries(body.data.files, fileHashes);
+    const entries = createTreeEntries(normalizedFiles, fileHashes);
     const treeHash = sha256Hex(JSON.stringify(entries));
     await repoService.upsertTree(treeHash, entries);
 
     const oldTree = await repoService.buildTreeMap(sourceBranch.headCommit);
-    const newTree = Object.fromEntries(entries.map((e) => [e.path, e.hash]));
+    const newTree = Object.fromEntries(entries.filter((e) => e.kind !== "dir").map((e) => [e.path, e.hash]));
     const diff = await computeDiff(oldTree, newTree, (hash) => blobStore.read(hash));
     const summary = repoService.summarizeDiff(diff);
 
@@ -1110,4 +1295,13 @@ function sanitizeRepoName(projectKey: string): string {
     .replace(/^-+|-+$/g, "")
     .slice(0, 64);
   return cleaned.length > 0 ? cleaned : `project-${Date.now()}`;
+}
+
+async function materializeFiles(entries: Array<{ path: string; hash: string; kind: string }>, blobStore: BlobStore) {
+  const files: Record<string, string> = {};
+  for (const entry of entries) {
+    if (entry.kind === "dir") continue;
+    files[entry.path] = await blobStore.read(entry.hash);
+  }
+  return files;
 }

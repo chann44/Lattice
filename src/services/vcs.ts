@@ -1,3 +1,4 @@
+import { extname } from "node:path";
 import type { DiffResult, ExperimentalDecision, TreeEntry, VersionBump } from "../types/api";
 
 const PYTHON_FUNC = /def\s+(\w+)\s*\((.*?)\)/g;
@@ -5,21 +6,53 @@ const PYTHON_CLASS = /class\s+(\w+)/g;
 const JS_FUNC = /(?:function\s+(\w+)\s*\((.*?)\))|(?:(\w+)\s*=\s*\((.*?)\)\s*=>)/g;
 const GO_FUNC = /func\s+(\w+)\s*\((.*?)\)/g;
 
-export function createTreeEntries(files: Record<string, string>, hashes: Record<string, string>): TreeEntry[] {
-  return Object.keys(files)
+export function createTreeEntries(
+  files: Record<string, { content: string; mode: "100644" | "100755" | "120000"; kind: "file" | "symlink" }>,
+  hashes: Record<string, string>,
+): TreeEntry[] {
+  const directorySet = new Set<string>();
+
+  for (const path of Object.keys(files)) {
+    const chunks = path.split("/");
+    let current = "";
+    for (let i = 0; i < chunks.length - 1; i += 1) {
+      current = current ? `${current}/${chunks[i]}` : chunks[i] ?? "";
+      if (current) directorySet.add(current);
+    }
+  }
+
+  const fileEntries: TreeEntry[] = Object.keys(files)
     .sort((a, b) => a.localeCompare(b))
     .map((path) => {
       const hash = hashes[path];
-      if (!hash) {
-        throw new Error(`missing hash for ${path}`);
+      const file = files[path];
+      if (!hash || !file) {
+        throw new Error(`missing file/hash for ${path}`);
       }
       return {
         path,
         hash,
-        mode: "file" as const,
-        size: files[path]?.length ?? 0,
+        kind: file.kind,
+        mode: file.mode,
+        size: file.content.length,
+        is_binary: isProbablyBinary(file.content),
+        content_type: inferContentType(path),
       };
     });
+
+  const dirEntries: TreeEntry[] = [...directorySet]
+    .sort((a, b) => a.localeCompare(b))
+    .map((path) => ({
+      path,
+      hash: `dir:${path}`,
+      kind: "dir" as const,
+      mode: "040000" as const,
+      size: 0,
+      is_binary: false,
+      content_type: "inode/directory",
+    }));
+
+  return [...dirEntries, ...fileEntries];
 }
 
 export async function computeDiff(
@@ -259,4 +292,28 @@ function lineCount(content: string): number {
 function basename(path: string): string {
   const chunks = path.split("/");
   return chunks[chunks.length - 1] ?? path;
+}
+
+function inferContentType(path: string): string {
+  const ext = extname(path).toLowerCase();
+  if (ext === ".ts") return "text/typescript";
+  if (ext === ".tsx") return "text/tsx";
+  if (ext === ".js") return "text/javascript";
+  if (ext === ".jsx") return "text/jsx";
+  if (ext === ".py") return "text/x-python";
+  if (ext === ".go") return "text/x-go";
+  if (ext === ".md") return "text/markdown";
+  if (ext === ".json") return "application/json";
+  if (ext === ".yml" || ext === ".yaml") return "application/yaml";
+  if (ext === ".png") return "image/png";
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  return "text/plain";
+}
+
+function isProbablyBinary(content: string): boolean {
+  for (let i = 0; i < content.length; i += 1) {
+    const code = content.charCodeAt(i);
+    if (code === 0) return true;
+  }
+  return false;
 }

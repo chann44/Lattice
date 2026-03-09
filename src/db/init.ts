@@ -74,10 +74,74 @@ export function initSchema(db: DBClient): void {
     );
   `);
 
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS project_contexts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT NOT NULL,
+      repo_id INTEGER NOT NULL,
+      project_key TEXT NOT NULL,
+      workspace_path TEXT,
+      fingerprint TEXT,
+      metadata TEXT,
+      created_at INTEGER DEFAULT (unixepoch()),
+      updated_at INTEGER DEFAULT (unixepoch()),
+      UNIQUE(agent_id, project_key)
+    );
+  `);
+
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS collaborators (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo_id INTEGER NOT NULL,
+      agent_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      created_at INTEGER DEFAULT (unixepoch()),
+      UNIQUE(repo_id, agent_id)
+    );
+  `);
+
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS pull_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo_id INTEGER NOT NULL,
+      number INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      source_branch TEXT NOT NULL,
+      target_branch TEXT NOT NULL,
+      created_by TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'open',
+      merged_by TEXT,
+      merge_commit_hash TEXT,
+      created_at INTEGER DEFAULT (unixepoch()),
+      updated_at INTEGER DEFAULT (unixepoch()),
+      UNIQUE(repo_id, number)
+    );
+  `);
+
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS pr_reviews (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo_id INTEGER NOT NULL,
+      pr_number INTEGER NOT NULL,
+      reviewer_agent_id TEXT NOT NULL,
+      decision TEXT NOT NULL,
+      comment TEXT,
+      created_at INTEGER DEFAULT (unixepoch())
+    );
+  `);
+
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_commits_repo_branch ON commits(repo_id, branch);`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_commits_repo_created ON commits(repo_id, created_at DESC);`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_branches_repo ON branches(repo_id);`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_repos_agent ON repos(agent_id);`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_blobs_hash ON blobs(hash);`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_trees_hash ON trees(hash);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_project_ctx_agent ON project_contexts(agent_id);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_project_ctx_repo ON project_contexts(repo_id);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_collaborators_repo ON collaborators(repo_id);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_collaborators_agent ON collaborators(agent_id);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_pr_repo ON pull_requests(repo_id);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_pr_state ON pull_requests(state);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_reviews_pr ON pr_reviews(repo_id, pr_number);`);
 }

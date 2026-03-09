@@ -1,6 +1,6 @@
 import { and, count, desc, eq, sql } from "drizzle-orm";
 import type { DBClient } from "../db/client";
-import { agents, blobs, branches, commits, repos, trees } from "../db/schema";
+import { agents, blobs, branches, collaborators, commits, prReviews, projectContexts, pullRequests, repos, trees } from "../db/schema";
 import type { DiffResult, TreeEntry } from "../types/api";
 
 function parseJson<T>(value: string | null | undefined, fallback: T): T {
@@ -72,16 +72,49 @@ export class RepositoryService {
     return this.db.query.repos.findFirst({ where: eq(repos.id, repoId) });
   }
 
+  async getRepoAccess(agentId: string, repoId: number): Promise<"owner" | "admin" | "write" | "read" | null> {
+    const repo = await this.getRepo(repoId);
+    if (!repo) return null;
+    if (repo.agentId === agentId) return "owner";
+    const collab = await this.db.query.collaborators.findFirst({
+      where: and(eq(collaborators.repoId, repoId), eq(collaborators.agentId, agentId)),
+    });
+    if (!collab) return null;
+    if (collab.role === "admin" || collab.role === "write" || collab.role === "read") return collab.role;
+    return null;
+  }
+
+  async addCollaborator(repoId: number, agentId: string, role: "admin" | "write" | "read") {
+    await this.db
+      .insert(collaborators)
+      .values({ repoId, agentId, role, createdAt: new Date() })
+      .onConflictDoUpdate({
+        target: [collaborators.repoId, collaborators.agentId],
+        set: { role },
+      });
+  }
+
+  async listCollaborators(repoId: number) {
+    return this.db.select().from(collaborators).where(eq(collaborators.repoId, repoId));
+  }
+
   async getBranch(repoId: number, name: string) {
     return this.db.query.branches.findFirst({ where: and(eq(branches.repoId, repoId), eq(branches.name, name)) });
   }
 
-  async createBranch(repoId: number, name: string, headCommit: string | null, reason: string, parentBranch: string): Promise<void> {
+  async createBranch(
+    repoId: number,
+    name: string,
+    headCommit: string | null,
+    reason: string,
+    parentBranch: string,
+    isExperimental = true,
+  ): Promise<void> {
     await this.db.insert(branches).values({
       repoId,
       name,
       headCommit,
-      isExperimental: true,
+      isExperimental,
       experimentReason: reason,
       parentBranch,
       createdAt: new Date(),
@@ -181,6 +214,187 @@ export class RepositoryService {
       .orderBy(desc(commits.createdAt))
       .limit(1);
     return latest[0]?.version ?? null;
+  }
+
+  async getLatestCommit(repoId: number, branch: string) {
+    const rows = await this.db
+      .select()
+      .from(commits)
+      .where(and(eq(commits.repoId, repoId), eq(commits.branch, branch)))
+      .orderBy(desc(commits.createdAt))
+      .limit(1);
+    return rows[0] ?? null;
+  }
+
+  async nextPullRequestNumber(repoId: number): Promise<number> {
+    const rows = await this.db
+      .select({ value: sql<number>`COALESCE(MAX(${pullRequests.number}), 0)` })
+      .from(pullRequests)
+      .where(eq(pullRequests.repoId, repoId));
+    return (rows[0]?.value ?? 0) + 1;
+  }
+
+  async createPullRequest(input: {
+    repoId: number;
+    title: string;
+    description: string;
+    sourceBranch: string;
+    targetBranch: string;
+    createdBy: string;
+  }) {
+    const number = await this.nextPullRequestNumber(input.repoId);
+    await this.db.insert(pullRequests).values({
+      repoId: input.repoId,
+      number,
+      title: input.title,
+      description: input.description,
+      sourceBranch: input.sourceBranch,
+      targetBranch: input.targetBranch,
+      createdBy: input.createdBy,
+      state: "open",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    return this.getPullRequest(input.repoId, number);
+  }
+
+  async listPullRequests(repoId: number, state?: "open" | "merged" | "closed") {
+    if (state) {
+      return this.db
+        .select()
+        .from(pullRequests)
+        .where(and(eq(pullRequests.repoId, repoId), eq(pullRequests.state, state)))
+        .orderBy(desc(pullRequests.createdAt));
+    }
+    return this.db.select().from(pullRequests).where(eq(pullRequests.repoId, repoId)).orderBy(desc(pullRequests.createdAt));
+  }
+
+  async getPullRequest(repoId: number, number: number) {
+    const rows = await this.db
+      .select()
+      .from(pullRequests)
+      .where(and(eq(pullRequests.repoId, repoId), eq(pullRequests.number, number)))
+      .limit(1);
+    return rows[0] ?? null;
+  }
+
+  async mergePullRequest(repoId: number, number: number, mergedBy: string, mergeCommitHash: string) {
+    await this.db
+      .update(pullRequests)
+      .set({
+        state: "merged",
+        mergedBy,
+        mergeCommitHash,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(pullRequests.repoId, repoId), eq(pullRequests.number, number)));
+  }
+
+  async closePullRequest(repoId: number, number: number) {
+    await this.db
+      .update(pullRequests)
+      .set({ state: "closed", updatedAt: new Date() })
+      .where(and(eq(pullRequests.repoId, repoId), eq(pullRequests.number, number)));
+  }
+
+  async addPullRequestReview(input: {
+    repoId: number;
+    prNumber: number;
+    reviewerAgentId: string;
+    decision: "approve" | "request_changes" | "comment";
+    comment?: string;
+  }) {
+    await this.db.insert(prReviews).values({
+      repoId: input.repoId,
+      prNumber: input.prNumber,
+      reviewerAgentId: input.reviewerAgentId,
+      decision: input.decision,
+      comment: input.comment,
+      createdAt: new Date(),
+    });
+  }
+
+  async listPullRequestReviews(repoId: number, prNumber: number) {
+    return this.db
+      .select()
+      .from(prReviews)
+      .where(and(eq(prReviews.repoId, repoId), eq(prReviews.prNumber, prNumber)))
+      .orderBy(desc(prReviews.createdAt));
+  }
+
+  async getRepoStatus(repoId: number, branch: string) {
+    const branchRows = await this.listBranches(repoId);
+    const latest = await this.getLatestCommit(repoId, branch);
+    const totalCommits = await this.db
+      .select({ value: count() })
+      .from(commits)
+      .where(and(eq(commits.repoId, repoId), eq(commits.branch, branch)));
+    return {
+      latest,
+      branches: branchRows,
+      totalCommits: totalCommits[0]?.value ?? 0,
+    };
+  }
+
+  async listReposWithLastCommit(agentId: string, page: number, perPage: number) {
+    const { rows, total } = await this.listRepos(agentId, page, perPage);
+    const withLast = await Promise.all(
+      rows.map(async (repo) => {
+        const last = await this.getLatestCommit(repo.id, repo.defaultBranch);
+        return { repo, last };
+      }),
+    );
+    return { rows: withLast, total };
+  }
+
+  async getProjectContext(agentId: string, projectKey: string) {
+    return this.db.query.projectContexts.findFirst({
+      where: and(eq(projectContexts.agentId, agentId), eq(projectContexts.projectKey, projectKey)),
+    });
+  }
+
+  async listProjectContextsByRepo(agentId: string, repoId: number) {
+    return this.db
+      .select()
+      .from(projectContexts)
+      .where(and(eq(projectContexts.agentId, agentId), eq(projectContexts.repoId, repoId)));
+  }
+
+  async upsertProjectContext(input: {
+    agentId: string;
+    repoId: number;
+    projectKey: string;
+    workspacePath?: string;
+    fingerprint?: string;
+    metadata?: Record<string, unknown>;
+  }) {
+    const existing = await this.getProjectContext(input.agentId, input.projectKey);
+    if (!existing) {
+      await this.db.insert(projectContexts).values({
+        agentId: input.agentId,
+        repoId: input.repoId,
+        projectKey: input.projectKey,
+        workspacePath: input.workspacePath,
+        fingerprint: input.fingerprint,
+        metadata: JSON.stringify(input.metadata ?? {}),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      return this.getProjectContext(input.agentId, input.projectKey);
+    }
+
+    await this.db
+      .update(projectContexts)
+      .set({
+        repoId: input.repoId,
+        workspacePath: input.workspacePath,
+        fingerprint: input.fingerprint,
+        metadata: JSON.stringify(input.metadata ?? {}),
+        updatedAt: new Date(),
+      })
+      .where(eq(projectContexts.id, existing.id));
+
+    return this.getProjectContext(input.agentId, input.projectKey);
   }
 
   async getRepoWithBranches(repoId: number) {

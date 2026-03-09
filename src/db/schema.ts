@@ -72,3 +72,73 @@ export const blobs = sqliteTable("blobs", {
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
   refCount: integer("ref_count").notNull().default(1),
 });
+
+export const projectContexts = sqliteTable(
+  "project_contexts",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    agentId: text("agent_id").notNull(),
+    repoId: integer("repo_id").notNull(),
+    projectKey: text("project_key").notNull(),
+    workspacePath: text("workspace_path"),
+    fingerprint: text("fingerprint"),
+    metadata: text("metadata"),
+    createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+    updatedAt: integer("updated_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  },
+  (table) => [
+    uniqueIndex("project_ctx_agent_key_uq").on(table.agentId, table.projectKey),
+    index("idx_project_ctx_agent").on(table.agentId),
+    index("idx_project_ctx_repo").on(table.repoId),
+  ],
+);
+
+export const collaborators = sqliteTable(
+  "collaborators",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    repoId: integer("repo_id").notNull(),
+    agentId: text("agent_id").notNull(),
+    role: text("role").notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  },
+  (table) => [
+    uniqueIndex("collaborators_repo_agent_uq").on(table.repoId, table.agentId),
+    index("idx_collaborators_repo").on(table.repoId),
+    index("idx_collaborators_agent").on(table.agentId),
+  ],
+);
+
+export const pullRequests = sqliteTable(
+  "pull_requests",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    repoId: integer("repo_id").notNull(),
+    number: integer("number").notNull(),
+    title: text("title").notNull(),
+    description: text("description"),
+    sourceBranch: text("source_branch").notNull(),
+    targetBranch: text("target_branch").notNull(),
+    createdBy: text("created_by").notNull(),
+    state: text("state").notNull().default("open"),
+    mergedBy: text("merged_by"),
+    mergeCommitHash: text("merge_commit_hash"),
+    createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+    updatedAt: integer("updated_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  },
+  (table) => [
+    uniqueIndex("pull_requests_repo_number_uq").on(table.repoId, table.number),
+    index("idx_pull_requests_repo").on(table.repoId),
+    index("idx_pull_requests_state").on(table.state),
+  ],
+);
+
+export const prReviews = sqliteTable("pr_reviews", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  repoId: integer("repo_id").notNull(),
+  prNumber: integer("pr_number").notNull(),
+  reviewerAgentId: text("reviewer_agent_id").notNull(),
+  decision: text("decision").notNull(),
+  comment: text("comment"),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+});

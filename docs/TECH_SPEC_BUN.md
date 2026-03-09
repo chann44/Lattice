@@ -22,7 +22,11 @@ Implemented endpoints:
 - `GET /v1/agent/me`
 - `POST /v1/repos`
 - `GET /v1/repos`
+- `GET /v1/repos/with-last-commit`
 - `GET /v1/repos/:id`
+- `GET /v1/repos/:id/status`
+- `GET /v1/repos/:id/last-commit`
+- `POST /v1/repos/:id/branches`
 - `POST /v1/repos/:id/check-hashes`
 - `POST /v1/repos/:id/push`
 - `GET /v1/repos/:id/commits`
@@ -31,7 +35,19 @@ Implemented endpoints:
 - `GET /v1/repos/:id/blob/:hash`
 - `GET /v1/repos/:id/branches`
 - `POST /v1/repos/:id/branches/:name/merge`
+- `GET /v1/repos/:id/collaborators`
+- `POST /v1/repos/:id/collaborators`
+- `POST /v1/repos/:id/pulls`
+- `GET /v1/repos/:id/pulls`
+- `GET /v1/repos/:id/pulls/:number`
+- `POST /v1/repos/:id/pulls/:number/reviews`
+- `POST /v1/repos/:id/pulls/:number/merge`
+- `POST /v1/repos/:id/pulls/:number/close`
+- `POST /v1/projects/identify`
+- `POST /v1/repos/:id/project-context`
+- `GET /v1/repos/:id/project-context`
 - `GET /v1/repos/:id/diff`
+- `GET /skills`
 - `GET /health`
 - `GET /metrics`
 
@@ -42,6 +58,9 @@ Implemented endpoints:
 - Regex-based breaking change detection for `.py`, `.js/.ts`, `.go`.
 - Risk-scored experimental branching for high-risk changes.
 - Auto-generated commit messages when custom message is omitted.
+- Collaboration model with `admin/write/read` roles.
+- Pull request lifecycle for agent-native review and merge flows.
+- Stable project context identification (`project_key`) for autonomous agents.
 
 ## Exclusions
 

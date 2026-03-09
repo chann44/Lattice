@@ -131,6 +131,36 @@ export function initSchema(db: DBClient): void {
     );
   `);
 
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS deployments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo_id INTEGER NOT NULL,
+      branch TEXT NOT NULL,
+      commit_hash TEXT NOT NULL,
+      tree_hash TEXT NOT NULL,
+      triggered_by TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'building',
+      entry_path TEXT,
+      public_url TEXT,
+      metadata TEXT,
+      logs TEXT,
+      created_at INTEGER DEFAULT (unixepoch()),
+      updated_at INTEGER DEFAULT (unixepoch())
+    );
+  `);
+
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS deployment_aliases (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo_id INTEGER NOT NULL,
+      deployment_id INTEGER NOT NULL,
+      slug TEXT NOT NULL,
+      updated_at INTEGER DEFAULT (unixepoch()),
+      UNIQUE(repo_id),
+      UNIQUE(slug)
+    );
+  `);
+
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_commits_repo_branch ON commits(repo_id, branch);`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_commits_repo_created ON commits(repo_id, created_at DESC);`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_branches_repo ON branches(repo_id);`);
@@ -144,4 +174,7 @@ export function initSchema(db: DBClient): void {
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_pr_repo ON pull_requests(repo_id);`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_pr_state ON pull_requests(state);`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_reviews_pr ON pr_reviews(repo_id, pr_number);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_deployments_repo ON deployments(repo_id);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_deployments_status ON deployments(status);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_deployment_aliases_deployment ON deployment_aliases(deployment_id);`);
 }

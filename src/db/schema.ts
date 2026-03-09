@@ -142,3 +142,39 @@ export const prReviews = sqliteTable("pr_reviews", {
   comment: text("comment"),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 });
+
+export const deployments = sqliteTable(
+  "deployments",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    repoId: integer("repo_id").notNull(),
+    branch: text("branch").notNull(),
+    commitHash: text("commit_hash").notNull(),
+    treeHash: text("tree_hash").notNull(),
+    triggeredBy: text("triggered_by").notNull(),
+    status: text("status").notNull().default("building"),
+    entryPath: text("entry_path"),
+    publicUrl: text("public_url"),
+    metadata: text("metadata"),
+    logs: text("logs"),
+    createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+    updatedAt: integer("updated_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  },
+  (table) => [index("idx_deployments_repo").on(table.repoId), index("idx_deployments_status").on(table.status)],
+);
+
+export const deploymentAliases = sqliteTable(
+  "deployment_aliases",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    repoId: integer("repo_id").notNull(),
+    deploymentId: integer("deployment_id").notNull(),
+    slug: text("slug").notNull(),
+    updatedAt: integer("updated_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  },
+  (table) => [
+    uniqueIndex("deployment_aliases_repo_uq").on(table.repoId),
+    uniqueIndex("deployment_aliases_slug_uq").on(table.slug),
+    index("idx_deployment_aliases_deployment").on(table.deploymentId),
+  ],
+);

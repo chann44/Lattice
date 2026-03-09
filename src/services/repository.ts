@@ -1,6 +1,19 @@
 import { and, count, desc, eq, sql } from "drizzle-orm";
 import type { DBClient } from "../db/client";
-import { agents, blobs, branches, collaborators, commits, prReviews, projectContexts, pullRequests, repos, trees } from "../db/schema";
+import {
+  agents,
+  blobs,
+  branches,
+  collaborators,
+  commits,
+  deploymentAliases,
+  deployments,
+  prReviews,
+  projectContexts,
+  pullRequests,
+  repos,
+  trees,
+} from "../db/schema";
 import type { DiffResult, TreeEntry } from "../types/api";
 
 function parseJson<T>(value: string | null | undefined, fallback: T): T {
@@ -320,6 +333,113 @@ export class RepositoryService {
       .from(prReviews)
       .where(and(eq(prReviews.repoId, repoId), eq(prReviews.prNumber, prNumber)))
       .orderBy(desc(prReviews.createdAt));
+  }
+
+  async createDeployment(input: {
+    repoId: number;
+    branch: string;
+    commitHash: string;
+    treeHash: string;
+    triggeredBy: string;
+    status: "building" | "ready" | "failed";
+    entryPath?: string;
+    publicUrl?: string;
+    metadata?: Record<string, unknown>;
+    logs?: string;
+  }) {
+    const rows = await this.db
+      .insert(deployments)
+      .values({
+        repoId: input.repoId,
+        branch: input.branch,
+        commitHash: input.commitHash,
+        treeHash: input.treeHash,
+        triggeredBy: input.triggeredBy,
+        status: input.status,
+        entryPath: input.entryPath,
+        publicUrl: input.publicUrl,
+        metadata: JSON.stringify(input.metadata ?? {}),
+        logs: input.logs ?? "",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .returning({ id: deployments.id });
+    return rows[0]?.id ?? null;
+  }
+
+  async updateDeployment(
+    deploymentId: number,
+    patch: Partial<{
+      status: "building" | "ready" | "failed";
+      entryPath: string;
+      publicUrl: string;
+      metadata: Record<string, unknown>;
+      logs: string;
+    }>,
+  ) {
+    await this.db
+      .update(deployments)
+      .set({
+        status: patch.status,
+        entryPath: patch.entryPath,
+        publicUrl: patch.publicUrl,
+        metadata: patch.metadata ? JSON.stringify(patch.metadata) : undefined,
+        logs: patch.logs,
+        updatedAt: new Date(),
+      })
+      .where(eq(deployments.id, deploymentId));
+  }
+
+  async getDeployment(repoId: number, deploymentId: number) {
+    const rows = await this.db
+      .select()
+      .from(deployments)
+      .where(and(eq(deployments.repoId, repoId), eq(deployments.id, deploymentId)))
+      .limit(1);
+    return rows[0] ?? null;
+  }
+
+  async getDeploymentById(deploymentId: number) {
+    const rows = await this.db.select().from(deployments).where(eq(deployments.id, deploymentId)).limit(1);
+    return rows[0] ?? null;
+  }
+
+  async listDeployments(repoId: number, limit: number) {
+    return this.db
+      .select()
+      .from(deployments)
+      .where(eq(deployments.repoId, repoId))
+      .orderBy(desc(deployments.createdAt))
+      .limit(limit);
+  }
+
+  async promoteDeployment(repoId: number, deploymentId: number, slug: string) {
+    await this.db
+      .insert(deploymentAliases)
+      .values({
+        repoId,
+        deploymentId,
+        slug,
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: deploymentAliases.repoId,
+        set: {
+          deploymentId,
+          slug,
+          updatedAt: new Date(),
+        },
+      });
+  }
+
+  async getDeploymentBySlug(slug: string) {
+    const rows = await this.db
+      .select({ alias: deploymentAliases, deployment: deployments })
+      .from(deploymentAliases)
+      .innerJoin(deployments, eq(deployments.id, deploymentAliases.deploymentId))
+      .where(eq(deploymentAliases.slug, slug))
+      .limit(1);
+    return rows[0] ?? null;
   }
 
   async getRepoStatus(repoId: number, branch: string) {

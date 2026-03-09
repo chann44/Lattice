@@ -125,6 +125,16 @@ const workspaceStatusSchema = z.object({
   local_head_commit: z.string().optional(),
 });
 
+const triggerDeploymentSchema = z.object({
+  branch: z.string().optional().default("main"),
+  promote: z.boolean().optional().default(true),
+  slug: z.string().optional(),
+});
+
+const promoteDeploymentSchema = z.object({
+  slug: z.string().optional(),
+});
+
 const metrics = {
   pushTotal: 0,
 };
@@ -145,7 +155,14 @@ export async function createApp(config: AppConfig) {
   app.use("*", async (c, next) => {
     const rawBody = await c.req.raw.clone().text();
     c.set("rawBody", rawBody);
-    if (c.req.path === "/health" || c.req.path === "/metrics" || c.req.path === "/skills" || c.req.path === "/v1/register") {
+    if (
+      c.req.path === "/health" ||
+      c.req.path === "/metrics" ||
+      c.req.path === "/skills" ||
+      c.req.path === "/v1/register" ||
+      c.req.path.startsWith("/deployments/") ||
+      c.req.path.startsWith("/apps/")
+    ) {
       await next();
       return;
     }
@@ -194,6 +211,26 @@ export async function createApp(config: AppConfig) {
       format: "markdown",
       content,
     });
+  });
+
+  app.get("/deployments/:id/*", async (c) => {
+    const deploymentId = Number(c.req.param("id"));
+    const deployment = await repoService.getDeploymentById(deploymentId);
+    if (!deployment || deployment.status !== "ready") {
+      return error(c, 404, "Not found", "Deployment not found");
+    }
+    const requestedPath = extractRequestedPath(c.req.path, `/deployments/${deploymentId}`);
+    return serveDeploymentPath(c, deployment.treeHash, requestedPath, blobStore, repoService);
+  });
+
+  app.get("/apps/:slug/*", async (c) => {
+    const slug = c.req.param("slug");
+    const binding = await repoService.getDeploymentBySlug(slug);
+    if (!binding || binding.deployment.status !== "ready") {
+      return error(c, 404, "Not found", "App not found");
+    }
+    const requestedPath = extractRequestedPath(c.req.path, `/apps/${slug}`);
+    return serveDeploymentPath(c, binding.deployment.treeHash, requestedPath, blobStore, repoService);
   });
 
   app.post("/v1/register", async (c) => {
@@ -1021,6 +1058,134 @@ export async function createApp(config: AppConfig) {
     });
   });
 
+  app.post("/v1/repos/:id/deployments", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "write");
+    if (!repoResult.ok) return repoResult.response;
+
+    const body = triggerDeploymentSchema.safeParse(parseBody(c.get("rawBody")));
+    if (!body.success) return error(c, 400, "Invalid request", body.error.message);
+
+    const branch = await repoService.getBranch(repoResult.repo.id, body.data.branch);
+    if (!branch || !branch.headCommit) return error(c, 404, "Not found", "Branch has no deployable commit");
+
+    const commit = await repoService.getCommit(branch.headCommit);
+    if (!commit) return error(c, 404, "Not found", "Commit not found");
+
+    const entries = await repoService.getTree(commit.treeHash);
+    const fileEntries = entries.filter((entry) => entry.kind !== "dir");
+    const entryPath = resolveEntrypoint(fileEntries.map((entry) => entry.path));
+
+    if (!entryPath) {
+      return error(c, 409, "Resource conflict", "No deployable entrypoint found (index.html or README.md)");
+    }
+
+    const deploymentId = await repoService.createDeployment({
+      repoId: repoResult.repo.id,
+      branch: branch.name,
+      commitHash: commit.hash,
+      treeHash: commit.treeHash,
+      triggeredBy: c.get("agentId"),
+      status: "building",
+      entryPath,
+      logs: "Build started\nBuild finished",
+      metadata: { file_count: fileEntries.length },
+    });
+
+    if (!deploymentId) {
+      return error(c, 500, "Internal error", "Failed to create deployment");
+    }
+
+    const slug = body.data.slug && body.data.slug.trim() ? sanitizeSlug(body.data.slug) : defaultRepoSlug(repoResult.repo.agentId, repoResult.repo.name);
+    const deploymentUrl = `/deployments/${deploymentId}`;
+    const appUrl = `/apps/${slug}`;
+
+    await repoService.updateDeployment(deploymentId, {
+      status: "ready",
+      publicUrl: deploymentUrl,
+      metadata: { file_count: fileEntries.length, slug },
+      logs: "Build started\nBuild finished\nDeployment ready",
+    });
+
+    if (body.data.promote) {
+      await repoService.promoteDeployment(repoResult.repo.id, deploymentId, slug);
+    }
+
+    return c.json(
+      {
+        id: deploymentId,
+        status: "ready",
+        branch: branch.name,
+        commit_hash: commit.hash,
+        deployment_url: deploymentUrl,
+        app_url: appUrl,
+        promoted: body.data.promote,
+      },
+      201,
+    );
+  });
+
+  app.get("/v1/repos/:id/deployments", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "read");
+    if (!repoResult.ok) return repoResult.response;
+    const limit = Number(c.req.query("limit") ?? "20");
+    const rows = await repoService.listDeployments(repoResult.repo.id, limit);
+    return c.json({
+      deployments: rows.map((item) => ({
+        id: item.id,
+        branch: item.branch,
+        status: item.status,
+        commit_hash: item.commitHash,
+        entry_path: item.entryPath,
+        public_url: item.publicUrl,
+        metadata: parseBody(item.metadata ?? "{}"),
+        logs: item.logs,
+        created_at: toISOString(item.createdAt),
+        updated_at: toISOString(item.updatedAt),
+      })),
+    });
+  });
+
+  app.get("/v1/repos/:id/deployments/:deploymentId", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "read");
+    if (!repoResult.ok) return repoResult.response;
+    const deploymentId = Number(c.req.param("deploymentId"));
+    const deployment = await repoService.getDeployment(repoResult.repo.id, deploymentId);
+    if (!deployment) return error(c, 404, "Not found", "Deployment not found");
+    return c.json({
+      id: deployment.id,
+      branch: deployment.branch,
+      status: deployment.status,
+      commit_hash: deployment.commitHash,
+      entry_path: deployment.entryPath,
+      public_url: deployment.publicUrl,
+      metadata: parseBody(deployment.metadata ?? "{}"),
+      logs: deployment.logs,
+      created_at: toISOString(deployment.createdAt),
+      updated_at: toISOString(deployment.updatedAt),
+    });
+  });
+
+  app.post("/v1/repos/:id/deployments/:deploymentId/promote", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "write");
+    if (!repoResult.ok) return repoResult.response;
+    const deploymentId = Number(c.req.param("deploymentId"));
+    const deployment = await repoService.getDeployment(repoResult.repo.id, deploymentId);
+    if (!deployment) return error(c, 404, "Not found", "Deployment not found");
+    if (deployment.status !== "ready") return error(c, 409, "Resource conflict", "Deployment is not ready");
+
+    const body = promoteDeploymentSchema.safeParse(parseBody(c.get("rawBody")));
+    if (!body.success) return error(c, 400, "Invalid request", body.error.message);
+
+    const slug = body.data.slug && body.data.slug.trim() ? sanitizeSlug(body.data.slug) : defaultRepoSlug(repoResult.repo.agentId, repoResult.repo.name);
+    await repoService.promoteDeployment(repoResult.repo.id, deploymentId, slug);
+    return c.json({
+      deployment_id: deploymentId,
+      slug,
+      app_url: `/apps/${slug}`,
+      success: true,
+    });
+  });
+
   app.post("/v1/repos/:id/collaborators", async (c) => {
     const repoResult = await authorizedRepo(c, repoService, "admin");
     if (!repoResult.ok) return repoResult.response;
@@ -1304,4 +1469,75 @@ async function materializeFiles(entries: Array<{ path: string; hash: string; kin
     files[entry.path] = await blobStore.read(entry.hash);
   }
   return files;
+}
+
+function resolveEntrypoint(paths: string[]): string | null {
+  if (paths.includes("index.html")) return "index.html";
+  if (paths.includes("README.md")) return "README.md";
+  return null;
+}
+
+function sanitizeSlug(value: string): string {
+  const cleaned = value
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+  return cleaned.length > 0 ? cleaned : `app-${Date.now()}`;
+}
+
+function defaultRepoSlug(agentId: string, repoName: string): string {
+  return sanitizeSlug(`${agentId}-${repoName}`);
+}
+
+async function serveDeploymentPath(
+  c: Context<AppEnv>,
+  treeHash: string,
+  requestedPath: string,
+  blobStore: BlobStore,
+  repoService: RepositoryService,
+) {
+  const entries = await repoService.getTree(treeHash);
+  const requested = requestedPath.length > 0 ? requestedPath.replace(/^\//, "") : "index.html";
+
+  const byPath = new Map(entries.map((entry) => [entry.path, entry]));
+  let entry = byPath.get(requested);
+
+  if (!entry && requested === "") {
+    entry = byPath.get("index.html");
+  }
+
+  if (!entry && !requested.includes(".")) {
+    entry = byPath.get(`${requested}/index.html`) ?? byPath.get("index.html");
+  }
+
+  if (!entry || entry.kind === "dir") {
+    return error(c, 404, "Not found", "File not found in deployment");
+  }
+
+  const content = await blobStore.read(entry.hash);
+  return new Response(content, {
+    status: 200,
+    headers: {
+      "Content-Type": entry.content_type ?? inferResponseContentType(entry.path),
+    },
+  });
+}
+
+function extractRequestedPath(fullPath: string, prefix: string): string {
+  if (!fullPath.startsWith(prefix)) return "";
+  const remainder = fullPath.slice(prefix.length);
+  return remainder.replace(/^\//, "");
+}
+
+function inferResponseContentType(path: string): string {
+  if (path.endsWith(".html")) return "text/html; charset=utf-8";
+  if (path.endsWith(".js")) return "application/javascript; charset=utf-8";
+  if (path.endsWith(".css")) return "text/css; charset=utf-8";
+  if (path.endsWith(".json")) return "application/json; charset=utf-8";
+  if (path.endsWith(".svg")) return "image/svg+xml";
+  if (path.endsWith(".png")) return "image/png";
+  if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
+  if (path.endsWith(".md")) return "text/markdown; charset=utf-8";
+  return "text/plain; charset=utf-8";
 }

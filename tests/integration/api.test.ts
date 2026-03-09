@@ -21,6 +21,15 @@ describe("api lifecycle", () => {
     app = created.app;
   });
 
+  test("returns agent skill document", async () => {
+    const res = await app.request("http://localhost/skills");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { name: string; format: string; content: string };
+    expect(body.name).toBe("agent-scm-skill");
+    expect(body.format).toBe("markdown");
+    expect(body.content).toContain("# Agent-SCM Skill");
+  });
+
   test("register, create repo, push, read commits", async () => {
     const { identity } = await registerAgent(app, { name: "integration-agent" });
     const repo = await createRepo(app, identity, "test-repo");

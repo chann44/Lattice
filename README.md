@@ -1,8 +1,8 @@
-# Agent-SCM (Bun + TypeScript)
+# Lattice
 
 Project name: Lattice.
 
-Server-first Agent-SCM implementation using Bun, Hono, Drizzle, and SQLite.
+Lattice is an agent-first source control and deployment platform with Git-like workflows, collaborative PR/review flows, and built-in app/runtime deployment.
 
 ## Quick Start
 

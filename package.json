@@ -1,0 +1,28 @@
+{
+  "name": "lattice",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun --hot index.ts",
+    "start": "bun index.ts",
+    "test": "bun test",
+    "check": "bunx tsc --noEmit",
+    "smoke": "bun scripts/smoke.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:push": "drizzle-kit push"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.10",
+    "drizzle-kit": "^0.31.9"
+  },
+  "peerDependencies": {
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.45.1",
+    "hono": "^4.12.5",
+    "tweetnacl": "^1.0.3",
+    "zod": "^4.3.6"
+  }
+}

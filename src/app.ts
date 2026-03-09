@@ -11,6 +11,7 @@ import { deriveAgentId, parseAuthHeader, verifyRequestSignature } from "./lib/au
 import { RateLimiter } from "./lib/rate-limiter";
 import { sha256Hex } from "./lib/hash";
 import { RepositoryService } from "./services/repository";
+import { BuildExecutor } from "./services/build-executor";
 import {
   buildUnifiedDiff,
   bumpVersion,
@@ -129,10 +130,17 @@ const triggerDeploymentSchema = z.object({
   branch: z.string().optional().default("main"),
   promote: z.boolean().optional().default(true),
   slug: z.string().optional(),
+  timeout_ms: z.number().int().min(10_000).max(600_000).optional().default(120_000),
+  memory_limit_mb: z.number().int().min(128).max(4096).optional().default(512),
 });
 
 const promoteDeploymentSchema = z.object({
   slug: z.string().optional(),
+});
+
+const createWebhookSchema = z.object({
+  url: z.string().url(),
+  secret: z.string().optional(),
 });
 
 const metrics = {
@@ -149,6 +157,7 @@ export async function createApp(config: AppConfig) {
   const repoService = new RepositoryService(db);
   const blobStore = new BlobStore(config.blobsDir);
   const limiter = new RateLimiter(config.rateLimitPerMinute, 60_000);
+  const buildExecutor = new BuildExecutor(repoService, blobStore, { concurrency: 2 });
 
   const app = new Hono<AppEnv>();
 
@@ -1087,7 +1096,7 @@ export async function createApp(config: AppConfig) {
       triggeredBy: c.get("agentId"),
       status: "building",
       entryPath,
-      logs: "Build started\nBuild finished",
+      logs: "Build queued",
       metadata: { file_count: fileEntries.length },
     });
 
@@ -1100,20 +1109,29 @@ export async function createApp(config: AppConfig) {
     const appUrl = `/apps/${slug}`;
 
     await repoService.updateDeployment(deploymentId, {
-      status: "ready",
       publicUrl: deploymentUrl,
       metadata: { file_count: fileEntries.length, slug },
-      logs: "Build started\nBuild finished\nDeployment ready",
+      logs: "Build queued",
     });
 
     if (body.data.promote) {
       await repoService.promoteDeployment(repoResult.repo.id, deploymentId, slug);
     }
 
+    const buildJobId = await buildExecutor.enqueue({
+      repoId: repoResult.repo.id,
+      deploymentId,
+      treeHash: commit.treeHash,
+      entryPath,
+      timeoutMs: body.data.timeout_ms,
+      memoryLimitMb: body.data.memory_limit_mb,
+    });
+
     return c.json(
       {
         id: deploymentId,
-        status: "ready",
+        status: "building",
+        build_job_id: buildJobId,
         branch: branch.name,
         commit_hash: commit.hash,
         deployment_url: deploymentUrl,
@@ -1183,6 +1201,60 @@ export async function createApp(config: AppConfig) {
       slug,
       app_url: `/apps/${slug}`,
       success: true,
+    });
+  });
+
+  app.get("/v1/repos/:id/deployments/:deploymentId/build-jobs", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "read");
+    if (!repoResult.ok) return repoResult.response;
+    const deploymentId = Number(c.req.param("deploymentId"));
+    const deployment = await repoService.getDeployment(repoResult.repo.id, deploymentId);
+    if (!deployment) return error(c, 404, "Not found", "Deployment not found");
+
+    const jobs = await repoService.listBuildJobsByDeployment(deploymentId);
+    return c.json({
+      build_jobs: jobs.map((job) => ({
+        id: job.id,
+        status: job.status,
+        timeout_ms: job.timeoutMs,
+        memory_limit_mb: job.memoryLimitMb,
+        logs: job.logs,
+        started_at: toISOString(job.startedAt),
+        completed_at: toISOString(job.completedAt),
+        created_at: toISOString(job.createdAt),
+      })),
+    });
+  });
+
+  app.post("/v1/repos/:id/deployment-webhooks", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "admin");
+    if (!repoResult.ok) return repoResult.response;
+    const body = createWebhookSchema.safeParse(parseBody(c.get("rawBody")));
+    if (!body.success) return error(c, 400, "Invalid request", body.error.message);
+
+    const id = await repoService.addDeploymentWebhook(repoResult.repo.id, body.data.url, body.data.secret);
+    return c.json(
+      {
+        id,
+        repo_id: repoResult.repo.id,
+        url: body.data.url,
+        enabled: true,
+      },
+      201,
+    );
+  });
+
+  app.get("/v1/repos/:id/deployment-webhooks", async (c) => {
+    const repoResult = await authorizedRepo(c, repoService, "read");
+    if (!repoResult.ok) return repoResult.response;
+    const hooks = await repoService.listDeploymentWebhooks(repoResult.repo.id);
+    return c.json({
+      webhooks: hooks.map((hook) => ({
+        id: hook.id,
+        url: hook.url,
+        enabled: hook.enabled,
+        created_at: toISOString(hook.createdAt),
+      })),
     });
   });
 

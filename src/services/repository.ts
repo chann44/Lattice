@@ -7,7 +7,9 @@ import {
   collaborators,
   commits,
   deploymentAliases,
+  deploymentWebhooks,
   deployments,
+  buildJobs,
   prReviews,
   projectContexts,
   pullRequests,
@@ -440,6 +442,59 @@ export class RepositoryService {
       .where(eq(deploymentAliases.slug, slug))
       .limit(1);
     return rows[0] ?? null;
+  }
+
+  async createBuildJob(input: {
+    deploymentId: number;
+    timeoutMs: number;
+    memoryLimitMb: number;
+  }) {
+    const rows = await this.db
+      .insert(buildJobs)
+      .values({
+        deploymentId: input.deploymentId,
+        status: "queued",
+        timeoutMs: input.timeoutMs,
+        memoryLimitMb: input.memoryLimitMb,
+        logs: "",
+        createdAt: new Date(),
+      })
+      .returning({ id: buildJobs.id });
+    return rows[0]?.id ?? null;
+  }
+
+  async markBuildJobRunning(jobId: number) {
+    await this.db.update(buildJobs).set({ status: "running", startedAt: new Date() }).where(eq(buildJobs.id, jobId));
+  }
+
+  async markBuildJobFinished(jobId: number, status: "ready" | "failed", logs: string) {
+    await this.db
+      .update(buildJobs)
+      .set({ status, logs, completedAt: new Date() })
+      .where(eq(buildJobs.id, jobId));
+  }
+
+  async listBuildJobsByDeployment(deploymentId: number) {
+    return this.db.select().from(buildJobs).where(eq(buildJobs.deploymentId, deploymentId)).orderBy(desc(buildJobs.createdAt));
+  }
+
+  async addDeploymentWebhook(repoId: number, url: string, secret?: string) {
+    const rows = await this.db
+      .insert(deploymentWebhooks)
+      .values({ repoId, url, secret, enabled: true, createdAt: new Date() })
+      .returning({ id: deploymentWebhooks.id });
+    return rows[0]?.id ?? null;
+  }
+
+  async listDeploymentWebhooks(repoId: number) {
+    return this.db.select().from(deploymentWebhooks).where(eq(deploymentWebhooks.repoId, repoId));
+  }
+
+  async getDeploymentWebhooks(repoId: number) {
+    return this.db
+      .select()
+      .from(deploymentWebhooks)
+      .where(and(eq(deploymentWebhooks.repoId, repoId), eq(deploymentWebhooks.enabled, true)));
   }
 
   async getRepoStatus(repoId: number, branch: string) {

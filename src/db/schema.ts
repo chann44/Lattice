@@ -178,3 +178,32 @@ export const deploymentAliases = sqliteTable(
     index("idx_deployment_aliases_deployment").on(table.deploymentId),
   ],
 );
+
+export const deploymentWebhooks = sqliteTable(
+  "deployment_webhooks",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    repoId: integer("repo_id").notNull(),
+    url: text("url").notNull(),
+    secret: text("secret"),
+    enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+    createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  },
+  (table) => [index("idx_deployment_webhooks_repo").on(table.repoId)],
+);
+
+export const buildJobs = sqliteTable(
+  "build_jobs",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    deploymentId: integer("deployment_id").notNull(),
+    status: text("status").notNull().default("queued"),
+    startedAt: integer("started_at", { mode: "timestamp" }),
+    completedAt: integer("completed_at", { mode: "timestamp" }),
+    timeoutMs: integer("timeout_ms").notNull().default(120000),
+    memoryLimitMb: integer("memory_limit_mb").notNull().default(512),
+    logs: text("logs"),
+    createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  },
+  (table) => [index("idx_build_jobs_deployment").on(table.deploymentId), index("idx_build_jobs_status").on(table.status)],
+);

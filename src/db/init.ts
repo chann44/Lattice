@@ -161,6 +161,31 @@ export function initSchema(db: DBClient): void {
     );
   `);
 
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS deployment_webhooks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo_id INTEGER NOT NULL,
+      url TEXT NOT NULL,
+      secret TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER DEFAULT (unixepoch())
+    );
+  `);
+
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS build_jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      deployment_id INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'queued',
+      started_at INTEGER,
+      completed_at INTEGER,
+      timeout_ms INTEGER NOT NULL DEFAULT 120000,
+      memory_limit_mb INTEGER NOT NULL DEFAULT 512,
+      logs TEXT,
+      created_at INTEGER DEFAULT (unixepoch())
+    );
+  `);
+
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_commits_repo_branch ON commits(repo_id, branch);`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_commits_repo_created ON commits(repo_id, created_at DESC);`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_branches_repo ON branches(repo_id);`);
@@ -177,4 +202,7 @@ export function initSchema(db: DBClient): void {
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_deployments_repo ON deployments(repo_id);`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_deployments_status ON deployments(status);`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_deployment_aliases_deployment ON deployment_aliases(deployment_id);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_deployment_webhooks_repo ON deployment_webhooks(repo_id);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_build_jobs_deployment ON build_jobs(deployment_id);`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_build_jobs_status ON build_jobs(status);`);
 }

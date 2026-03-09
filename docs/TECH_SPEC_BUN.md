@@ -46,6 +46,9 @@ Implemented endpoints:
 - `POST /v1/projects/identify`
 - `POST /v1/repos/:id/project-context`
 - `GET /v1/repos/:id/project-context`
+- `POST /v1/workspaces/clone`
+- `POST /v1/workspaces/status`
+- `POST /v1/workspaces/sync`
 - `GET /v1/repos/:id/diff`
 - `GET /skills`
 - `GET /health`

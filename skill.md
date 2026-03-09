@@ -39,6 +39,16 @@ This prevents accidental pushes to the wrong repo when multiple projects exist.
 1. `GET /v1/repos/:id/last-commit?branch=main`
 2. `GET /v1/repos/:id/commits?branch=main&limit=20`
 3. `GET /v1/repos/:id/status?branch=main`
+4. Optional richer workspace sync:
+   - `POST /v1/workspaces/status`
+   - `POST /v1/workspaces/sync`
+
+### 2.1) Clone / Materialize Workflow (No Git Required)
+
+1. `POST /v1/workspaces/clone` with `project_key` (+ `create_if_missing` on first run).
+2. Write `files` payload to local workspace paths.
+3. Persist returned `state` in `.agent-scm/state.json`.
+4. Use saved `head_commit/tree_hash` for future sync checks.
 
 ### 3) Push Workflow (Git Add/Commit/Push Analog)
 
@@ -66,6 +76,7 @@ This prevents accidental pushes to the wrong repo when multiple projects exist.
 - Branching: `GET /v1/repos/:id/branches`, `POST /v1/repos/:id/branches`, `POST /v1/repos/:id/branches/:name/merge`
 - Collaboration: `GET /v1/repos/:id/collaborators`, `POST /v1/repos/:id/collaborators`
 - Pull requests: `POST /v1/repos/:id/pulls`, `GET /v1/repos/:id/pulls`, `GET /v1/repos/:id/pulls/:number`, `POST /v1/repos/:id/pulls/:number/reviews`, `POST /v1/repos/:id/pulls/:number/merge`, `POST /v1/repos/:id/pulls/:number/close`
+- Workspaces: `POST /v1/workspaces/clone`, `POST /v1/workspaces/status`, `POST /v1/workspaces/sync`
 - Commits/history: `GET /v1/repos/:id/last-commit`, `GET /v1/repos/:id/commits`, `GET /v1/repos/:id/commits/:hash`
 - Content: `GET /v1/repos/:id/tree`, `GET /v1/repos/:id/blob/:hash`
 - Change analysis: `POST /v1/repos/:id/check-hashes`, `POST /v1/repos/:id/push`, `GET /v1/repos/:id/diff`, `GET /v1/repos/:id/status`

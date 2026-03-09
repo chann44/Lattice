@@ -49,6 +49,12 @@ Implemented endpoints:
 - `POST /v1/workspaces/clone`
 - `POST /v1/workspaces/status`
 - `POST /v1/workspaces/sync`
+- `POST /v1/repos/:id/deployments`
+- `GET /v1/repos/:id/deployments`
+- `GET /v1/repos/:id/deployments/:deploymentId`
+- `POST /v1/repos/:id/deployments/:deploymentId/promote`
+- `GET /deployments/:id/*`
+- `GET /apps/:slug/*`
 - `GET /v1/repos/:id/diff`
 - `GET /skills`
 - `GET /health`

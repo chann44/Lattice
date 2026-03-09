@@ -68,6 +68,17 @@ This prevents accidental pushes to the wrong repo when multiple projects exist.
 1. `GET /v1/repos/with-last-commit`
 2. Use `last_commit` fields to decide which repos need attention.
 
+### 6) Deployment Workflow (Vercel-like Trigger)
+
+1. Trigger deploy from a branch: `POST /v1/repos/:id/deployments`
+2. Poll status: `GET /v1/repos/:id/deployments/:deploymentId`
+3. Promote to stable app URL: `POST /v1/repos/:id/deployments/:deploymentId/promote`
+4. Access deployed app:
+   - Immutable URL: `/deployments/:deploymentId/<path>`
+   - Promoted URL: `/apps/:slug/<path>`
+
+Deployment permission requires write access (owner/admin/write).
+
 ## Endpoint Set (Agent-Oriented)
 
 - Identity: `POST /v1/register`, `GET /v1/agent/me`
@@ -77,6 +88,7 @@ This prevents accidental pushes to the wrong repo when multiple projects exist.
 - Collaboration: `GET /v1/repos/:id/collaborators`, `POST /v1/repos/:id/collaborators`
 - Pull requests: `POST /v1/repos/:id/pulls`, `GET /v1/repos/:id/pulls`, `GET /v1/repos/:id/pulls/:number`, `POST /v1/repos/:id/pulls/:number/reviews`, `POST /v1/repos/:id/pulls/:number/merge`, `POST /v1/repos/:id/pulls/:number/close`
 - Workspaces: `POST /v1/workspaces/clone`, `POST /v1/workspaces/status`, `POST /v1/workspaces/sync`
+- Deployments: `POST /v1/repos/:id/deployments`, `GET /v1/repos/:id/deployments`, `GET /v1/repos/:id/deployments/:deploymentId`, `POST /v1/repos/:id/deployments/:deploymentId/promote`, `GET /deployments/:id/*`, `GET /apps/:slug/*`
 - Commits/history: `GET /v1/repos/:id/last-commit`, `GET /v1/repos/:id/commits`, `GET /v1/repos/:id/commits/:hash`
 - Content: `GET /v1/repos/:id/tree`, `GET /v1/repos/:id/blob/:hash`
 - Change analysis: `POST /v1/repos/:id/check-hashes`, `POST /v1/repos/:id/push`, `GET /v1/repos/:id/diff`, `GET /v1/repos/:id/status`
